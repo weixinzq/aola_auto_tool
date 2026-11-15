@@ -6,8 +6,6 @@ import logging
 
 from src.network.context import AppContext, MessageRouter
 from src.accounts.login import LoginBlockedError, LoginResult, ZoneData, http_login
-from src.accounts.browser_login import browser_login
-from src.config import default_config
 from src.network.socket_client import login_and_connect
 from src.protocol.operations import init_game
 
@@ -25,35 +23,39 @@ def select_zone(result: LoginResult, preferred_zone: int = 1025) -> ZoneData | N
     )
 
 
-async def authenticate(config: dict, *, interactive: bool = False) -> tuple[LoginResult, ZoneData]:
-    if interactive:
-        defaults = default_config()
-        result = await browser_login(
-            config["account"], config["password"], int(config.get("char_id", 0)),
-            config.get("login_url") or defaults["login_url"],
-            config.get("register_url") or defaults["register_url"],
+async def authenticate(config: dict) -> tuple[LoginResult, ZoneData]:
+    attempts = 1 if config.get("login_once") else 3
+    attempt = 0
+    while attempt < attempts:
+        result = await http_login(
+            config["account"],
+            config["password"],
+            char_id=int(config.get("char_id", 0)),
+            login_url=config.get("login_url"),
+            register_url=config.get("register_url"),
+            browser_verification=False,
+            timeout=float(config.get("timeout", 30)),
+            **({"network_mode": "system", "diagnostic_dir": config.get("diagnostic_dir")}
+               if config.get("network_mode") == "system" else {}),
+            **({"proxy_url": config["proxy_url"]} if config.get("proxy_url") else {}),
         )
-    else:
-        for attempt in range(1, 4):
-            result = await http_login(
-                config["account"],
-                config["password"],
-                char_id=int(config.get("char_id", 0)),
-                login_url=config.get("login_url"),
-                register_url=config.get("register_url"),
-                browser_verification=bool(config.get("browser_verification", False)),
-                timeout=float(config.get("timeout", 30)),
-                **({"network_mode": "system", "diagnostic_dir": config.get("diagnostic_dir")}
-                   if config.get("network_mode") == "system" else {}),
-                **({"proxy_url": config["proxy_url"]} if config.get("proxy_url") else {}),
-            )
-            if result.success or result.blocked_reason:
+        if result.success:
+            break
+        if result.blocked_reason:
+            if config.get("login_once"):
                 break
-            logger.warning("HTTP 认证第 %d/3 次失败，阶段=%s，HTTP状态=%s%s",
-                           attempt, result.http_stage, result.http_status,
-                           "；0.5 秒后重试" if attempt < 3 else "；已用完重试次数")
-            if attempt < 3:
-                await asyncio.sleep(0.5)
+            delay = max(300.0, result.retry_after)
+            logger.warning("登录受阻：%s；等待 %.0f 秒后重新登录，可取消任务",
+                           result.blocked_reason, delay)
+            await asyncio.sleep(delay)
+            attempt = 0
+            continue
+        attempt += 1
+        logger.warning("HTTP 认证第 %d/%d 次失败，阶段=%s，HTTP状态=%s%s",
+                       attempt, attempts, result.http_stage, result.http_status,
+                       "；0.5 秒后重试" if attempt < attempts else "；已用完重试次数")
+        if attempt < attempts:
+            await asyncio.sleep(0.5)
     if not result.success:
         if result.blocked_reason:
             raise LoginBlockedError(result.blocked_reason, result.error_msg)
@@ -190,14 +192,15 @@ def start_player_initialization(
     )
 
 
-async def open_context(config: dict, *, interactive: bool = False) -> AppContext:
-    result, zone = await authenticate(config, interactive=interactive)
+async def open_context(config: dict) -> AppContext:
+    result, zone = await authenticate(config)
     socket = await login_and_connect(
         zone,
         result.user_id,
         result.session_id,
         timeout=float(config.get("timeout", 2)),
         tcp_retry_window=10.0,
+        **({"single_attempt": True} if config.get("login_once") else {}),
         **({"network_mode": "system"} if config.get("network_mode") == "system" else {}),
         **({"proxy_url": config["proxy_url"]} if config.get("proxy_url") else {}),
     )

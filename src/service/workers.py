@@ -1,4 +1,4 @@
-"""Parent-side pipe RPC and connection adapters for isolated outbound groups."""
+"""Parent-side control RPC and connection adapters for isolated outbound groups."""
 import asyncio
 import json
 import os
@@ -9,6 +9,7 @@ from src.accounts.manager import AccountConnection
 from src.service.contracts import ServiceError
 from src.service.events import utc_now
 from src.service.worker_process import WorkerJob, prepare_worker_executable, worker_environment, worker_executable
+from src.service.worker_transport import MESSAGE_LIMIT, PORT_ENV, TOKEN_ENV, WorkerListener
 
 
 class Worker:
@@ -18,9 +19,11 @@ class Worker:
         self.state, self.error = "offline", None
         self.exit_ip = self.exit_checked_at = None
         self.pending = {}
+        self.step_callbacks = {}
         self.connections = {}
         self.start_lock, self.write_lock, self.stop_lock = asyncio.Lock(), asyncio.Lock(), asyncio.Lock()
-        self.reader = self.stderr = None
+        self.reader = self.stdout = self.stderr = None
+        self.control_reader = self.control_writer = None
         self.closing = False
 
     def profile(self):
@@ -37,20 +40,29 @@ class Worker:
                 raise ServiceError("worker_stopping", "出口执行进程正在关闭", 503)
             if self.state == "ready" and self.process and self.process.returncode is None:
                 return
+            await asyncio.gather(*(task for task in (self.reader, self.stdout, self.stderr) if task is not None),
+                                 return_exceptions=True)
             executable = prepare_worker_executable(self.pool.directory, self.group_id)
             self.state, self.error = "starting", None
             self.publish()
+            listener = WorkerListener()
             try:
+                await listener.start()
                 if self.pool.job is None:
                     self.pool.job = WorkerJob()
+                environment = worker_environment()
+                environment.update({PORT_ENV: str(listener.port), TOKEN_ENV: listener.token})
                 self.process = await asyncio.create_subprocess_exec(
                     str(executable), "-u", "-B", "-m", self.pool.module, "--parent-pid", str(os.getpid()),
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                    env=worker_environment(), limit=16 * 1024 * 1024,
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    env=environment, limit=MESSAGE_LIMIT,
                     **({"creationflags": 0x08000000} if os.name == "nt" else {}))
                 self.pool.job.assign(self.process.pid)
+                self.stdout = asyncio.create_task(self.read_output(self.process.stdout))
+                self.stderr = asyncio.create_task(self.read_output(self.process.stderr, error=True))
+                self.control_reader, self.control_writer = await listener.accept()
+                await listener.close()
                 self.reader = asyncio.create_task(self.read())
-                self.stderr = asyncio.create_task(self.read_stderr())
                 hello = await asyncio.wait_for(self._request("hello"), 15)
                 if Path(hello["executable"]).resolve() != executable or hello["pid"] != self.process.pid:
                     raise ServiceError("worker_identity", "执行进程真实路径不匹配，已停止该组")
@@ -59,16 +71,21 @@ class Worker:
             except BaseException:
                 await self.lost("执行进程启动失败，请检查运行环境")
                 raise
+            finally:
+                await listener.close()
 
     async def read(self):
         reason = "出口执行进程已断开"
         try:
-            while line := await self.process.stdout.readline():
+            while line := await self.control_reader.readline():
                 response = json.loads(line)
                 if "id" in response:
                     future = self.pending.get(response["id"])
                     if future is not None and not future.done():
                         future.set_result(response)
+                elif response.get("event") == "steps":
+                    if response["request_id"] in self.step_callbacks:
+                        self.step_callbacks[response["request_id"]](response["steps"])
                 elif response.get("event") == "log":
                     connection = self.connections.get(response.get("account_id"))
                     if connection and connection.context:
@@ -82,12 +99,25 @@ class Worker:
         finally:
             await self.lost(reason)
 
-    async def read_stderr(self):
-        while line := await self.process.stderr.readline():
-            self.error = self.pool.store.redact(line.decode("utf-8", errors="replace").strip())[:500]
+    async def read_output(self, stream, *, error=False):
+        # Native libraries may write arbitrary data without newlines to either stream.
+        while chunk := await stream.read(65536):
+            if error:
+                self.error = self.pool.store.redact(chunk.decode("utf-8", errors="replace").strip())[-500:]
+
+    async def close_channel(self):
+        writer = self.control_writer
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
     async def lost(self, reason):
         async with self.stop_lock:
+            if self.state in {"offline", "failed"} and (not self.process or self.process.returncode is not None):
+                return
             process = self.process
             if process and process.returncode is None:
                 try:
@@ -102,6 +132,7 @@ class Worker:
                     except ProcessLookupError:
                         pass
                     await process.wait()
+            await self.close_channel()
             self.state = "offline" if self.closing else "failed"
             self.error = None if self.closing else reason
             for connection in list(self.connections.values()):
@@ -113,19 +144,23 @@ class Worker:
                 self.pool.on_lost(self.group_id)
             self.publish()
 
-    async def _request(self, operation, account_id=None, data=None, outcome=None):
+    async def _request(self, operation, account_id=None, data=None, outcome=None, on_steps=None):
         request_id = uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
+        if on_steps is not None:
+            self.step_callbacks[request_id] = on_steps
         message = json.dumps({"id": request_id, "op": operation, "account_id": account_id, "data": data or {}},
                              ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         try:
             sent = False
             try:
                 async with self.write_lock:
-                    self.process.stdin.write(message)
+                    if self.control_writer is None or self.control_writer.is_closing():
+                        raise ConnectionError("Worker control channel is closed")
+                    self.control_writer.write(message)
                     sent = True
-                    await self.process.stdin.drain()
+                    await self.control_writer.drain()
                 response = await asyncio.shield(future)
             except asyncio.CancelledError:
                 if not sent or operation in {"cancel", "shutdown", "hello"}:
@@ -152,6 +187,7 @@ class Worker:
             raise ServiceError("worker_lost", "出口执行进程连接丢失") from error
         finally:
             self.pending.pop(request_id, None)
+            self.step_callbacks.pop(request_id, None)
             if future.done() and not future.cancelled():
                 future.exception()
             elif not future.done():
@@ -177,11 +213,11 @@ class Worker:
             if self.process and self.process.returncode is None:
                 try:
                     await asyncio.wait_for(self._request("shutdown"), 10)
-                    self.process.stdin.close()
+                    await self.close_channel()
                     await asyncio.wait_for(self.process.wait(), 5)
                 except Exception:
                     await self.lost("执行进程关闭")
-        for task in (self.reader, self.stderr):
+        for task in (self.reader, self.stdout, self.stderr):
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
 
@@ -227,9 +263,11 @@ class RemoteContext:
     async def wait_for_player_initialization(self):
         await self.connection.worker.request("initialize", self.connection.account_id)
 
-    async def execute_steps(self, steps, outcome, **options):
+    async def execute_steps(self, steps, outcome, *, on_steps=None, **options):
         await self.connection.worker.request("execute", self.connection.account_id,
-                                             {"steps": steps, "options": options}, outcome=outcome)
+                                             {"steps": steps, "options": options,
+                                              "stream_results": on_steps is not None},
+                                             outcome=outcome, on_steps=on_steps)
 
 
 class RemoteAccountConnection:

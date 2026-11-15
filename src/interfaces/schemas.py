@@ -197,6 +197,19 @@ class TaskResults(BaseModel):
     server_results: list[ServerProbeResult] = Field(default_factory=list)
 
 
+class TaskSummary(BaseModel):
+    task_id: str
+    state: TaskState
+    error: ErrorInfo | None
+    kind: Literal["connect", "reconnect", "disconnect", "execute", "server_probe"]
+    created_at: str
+    updated_at: str | None = None
+    started_at: str | None
+    finished_at: str | None
+    account_count: int
+    skipped_repetitions: int
+
+
 class TaskRecord(TaskResults):
     kind: Literal["connect", "reconnect", "disconnect", "execute", "server_probe"]
     created_at: str

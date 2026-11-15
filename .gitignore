@@ -1,25 +1,15 @@
-# 默认只发布下方列出的源码、依赖和构建输入；本地任务及运行数据不纳入 Git。
+# Publish only backend/frontend source and required build inputs.
 *
 !*/
-
-# 项目入口、依赖和说明
 !/.gitignore
-!/README.md
+!/backend_main.py
+!/cli_main.py
 !/pyproject.toml
+!/setup.py
 !/requirements.txt
 !/requirements.lock
-!/requirements-build.txt
-!/cli_main.py
-!/backend_main.py
-
-# Python 实现和随程序提供的专用脚本
 !/src/**/*.py
-!/scripts/*.py
-/scripts/test_*.py
-/scripts/verify.py
-/scripts/_fake_mihomo.py
-!/Com/**
-# 网页源码及构建依赖
+!/src/protocol/_amf3_native.cpp
 !/frontend/index.html
 !/frontend/package.json
 !/frontend/package-lock.json
@@ -30,42 +20,33 @@
 !/frontend/src/**/*.css
 /frontend/src/**/*.test.ts
 
-# 旧版 Windows 桌面源码及打包输入
-!/csharp/AolaLoader/**/*.cs
-!/csharp/AolaLoader/**/*.xaml
-!/csharp/AolaLoader/*.csproj
-!/build_wpf.ps1
-!/aola_backend.spec
-!/config.example.json
-
-# 通用接口导出和探测工具；具体任务 JSON 不发布
-!/tools/export_openapi.py
-!/tools/run_server_probe.py
-# 正式服务器的稳定入口模板；不包含配置、凭据或发布产物。
-!/tools/server/manage.sh
-!/tools/server/manage.py
-!/tools/server/run-service.sh
-!/tools/server/cli_main.py
-!/tools/server/aola-offline-loader-root.service
-
-# 排除缓存、依赖、构建产物与本地文件（优先于上方源码规则）
-.git/
+# Local dependencies, generated output, and private task data.
 __pycache__/
 node_modules/
 bin/
 obj/
 /.venv/
+/.git-backups/
 /build/
 /dist/
 /frontend/dist/
-/frontend/coverage/
 /data/
 /logs/
 /evidence/
-/.git-backups/
 /analysis/
 /tte/
+/tutorial/
+/tuitorial/
+/docs/
+/docx/
+/task/
+/tasks/
+/operations/
+/Com/
 /Script/
-
+/script/
+/scripts/
+/tools/
+/csharp/
 /.agents/
 /.codex/

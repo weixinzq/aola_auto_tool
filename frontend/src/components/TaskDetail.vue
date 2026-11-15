@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { isActive, label, time, tone } from '../presentation'
 import type { Account, LogEntry, TaskRecord } from '../types'
 
@@ -7,6 +7,11 @@ const props = defineProps<{ task: TaskRecord; logs: LogEntry[]; accounts: Accoun
 defineEmits<{ close: []; cancel: []; moreLogs: [] }>()
 const accountNames = computed(() => new Map(props.accounts.map(account => [account.account_id, account.label || account.account])))
 const name = (id?: string | null) => id ? accountNames.value.get(id) || id : '服务'
+const resultPage = ref(1)
+const resultPages = computed(() => Math.max(1, Math.ceil(props.task.account_results.length / 50)))
+const visibleResults = computed(() => props.task.account_results.slice((resultPage.value - 1) * 50, resultPage.value * 50))
+watch(() => props.task.task_id, () => { resultPage.value = 1 })
+watch(resultPages, pages => { resultPage.value = Math.min(resultPage.value, pages) })
 const visibleLogs = computed(() => props.logs.slice(-200))
 const completed = computed(() => props.task.account_results.filter(a => a.state === 'succeeded').length)
 const recovered = computed(() => props.task.account_results.reduce((n, a) => n + (a.skipped_repetitions ?? 0), 0))
@@ -21,8 +26,13 @@ const skipped = computed(() => props.task.account_results.filter(a => a.state ==
     <div v-if="skipped.length" class="notice" role="status"><strong>{{ skipped.length }} 个账号已跳过</strong><p>{{ skipped.map(result => name(result.account_id)).join('、') }}。其余账号的执行结果见下表。</p></div>
     <h3>逐账号结果</h3>
     <p class="help">本地网络写入与服务器业务确认分别展示；未知表示尚无业务确认。</p>
-    <div class="table-scroll"><table><thead><tr><th>账号</th><th>出口 IP</th><th>执行结果</th><th>轮次：尝试 / 正常 / 跳过</th><th>本地网络写入</th><th>服务器业务确认</th></tr></thead><tbody><tr v-for="result in task.account_results" :key="result.account_id"><td><strong>{{ name(result.account_id) }}</strong><small v-if="result.error" class="danger-text">{{ result.error.message }}</small></td><td>{{ result.exit_ip || '—' }}</td><td><span class="badge" :class="result.state === 'succeeded' && result.skipped_repetitions ? 'working' : tone(result.state)">{{ result.state === 'succeeded' && result.skipped_repetitions ? '完成，含跳过' : label(result.state) }}</span></td><td>{{ result.attempted_repetitions ?? result.completed_repetitions }} / {{ result.completed_repetitions }} / {{ result.skipped_repetitions ?? 0 }}</td><td>{{ result.network_write.count === null ? '次数未知' : `${result.network_write.count} 次` }}<span class="muted"> · {{ result.network_write.status === 'succeeded' ? '已写入' : label(result.network_write.status) }}</span></td><td>{{ label(result.business_confirmation) }}</td></tr><tr v-if="!task.account_results.length"><td colspan="6" class="empty">暂时没有账号结果</td></tr></tbody></table></div>
-    <h3 class="log-heading">运行日志 <span class="muted">已载入 {{ logs.length }} 条，显示最近 {{ visibleLogs.length }} 条，最多显示 200 条；实时更新间隔 0.2 秒</span> <button v-if="moreLogs" class="text-button" :disabled="logLoading" @click="$emit('moreLogs')">{{ logLoading ? '读取中…' : '加载更多' }}</button></h3>
+    <nav v-if="resultPages > 1" class="button-row" aria-label="结果分页">
+      <button class="button secondary small" :disabled="resultPage <= 1" @click="resultPage--">上一页</button>
+      <span>第 {{ resultPage }} / {{ resultPages }} 页 · 每页 50 个账号</span>
+      <button class="button secondary small" :disabled="resultPage >= resultPages" @click="resultPage++">下一页</button>
+    </nav>
+    <div class="table-scroll"><table><thead><tr><th>账号</th><th>出口 IP</th><th>执行结果</th><th>轮次：尝试 / 正常 / 跳过</th><th>本地网络写入</th><th>服务器业务确认</th></tr></thead><tbody><tr v-for="result in visibleResults" :key="result.account_id"><td><strong>{{ name(result.account_id) }}</strong><small v-if="result.error" class="danger-text">{{ result.error.message }}</small></td><td>{{ result.exit_ip || '—' }}</td><td><span class="badge" :class="result.state === 'succeeded' && result.skipped_repetitions ? 'working' : tone(result.state)">{{ result.state === 'succeeded' && result.skipped_repetitions ? '完成，含跳过' : label(result.state) }}</span></td><td>{{ result.attempted_repetitions ?? result.completed_repetitions }} / {{ result.completed_repetitions }} / {{ result.skipped_repetitions ?? 0 }}</td><td>{{ result.network_write.count === null ? '次数未知' : `${result.network_write.count} 次` }}<span class="muted"> · {{ result.network_write.status === 'succeeded' ? '已写入' : label(result.network_write.status) }}</span></td><td>{{ label(result.business_confirmation) }}</td></tr><tr v-if="!task.account_results.length"><td colspan="6" class="empty">暂时没有账号结果</td></tr></tbody></table></div>
+    <h3 class="log-heading">运行日志 <span class="muted">已载入 {{ logs.length }} 条，显示最近 {{ visibleLogs.length }} 条，最多显示 200 条；日志每秒合并更新</span> <button v-if="moreLogs" class="text-button" :disabled="logLoading" @click="$emit('moreLogs')">{{ logLoading ? '读取中…' : '加载更多' }}</button></h3>
     <div class="log-view" role="log" aria-label="任务运行日志"><div v-for="entry in visibleLogs" :key="entry.id" class="log-line"><time>{{ time(entry.timestamp) }}</time><span class="log-account">{{ name(entry.account_id) }}</span><span>{{ entry.message }}</span></div><p v-if="!logs.length" class="muted">暂无日志</p></div>
   </section>
 </template>

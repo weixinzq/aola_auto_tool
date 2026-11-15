@@ -20,11 +20,11 @@ import logging
 import struct
 import time
 import xml.etree.ElementTree as ET
-from typing import Any
+from typing import Any, Callable
 
 from src.config import UpCmd, DownCmd, MSG_TYPE_SYS, MSG_TYPE_EXT
 from src.protocol.msgseq import MsgSeq, InnerSeq
-from src.protocol.amf3 import Amf3Reader
+from src.protocol.amf3 import Amf3Reader, decode_amf3
 from src.protocol.encrypt import outer_xor_encrypt
 from src.protocol.message_codec import (
     build_login_message,
@@ -82,6 +82,7 @@ class GameSocket:
         self._connected = False
         self._use_ws = False
         self.disconnect_reason = ""
+        self.message_trace: Callable[..., None] | None = None
         # A desktop batch and an interaction script can otherwise reach the
         # same account concurrently. Keep sequence generation and transport
         # writes atomic per connection while leaving different accounts free
@@ -130,7 +131,7 @@ class GameSocket:
             # 读取 Flash 安全策略文件
             try:
                 policy = bytearray()
-                async with asyncio.timeout(0.2):
+                async with asyncio.timeout(2.0):
                     while True:
                         b = await self._reader.readexactly(1)
                         if b[0] == 0: break
@@ -142,7 +143,7 @@ class GameSocket:
                     return False
                 print(f"[TCP] Policy: {policy.decode('ascii', errors='replace')[:200]}")
             except asyncio.TimeoutError:
-                self.disconnect_reason = "TCP 安全策略等待超过 0.2 秒"
+                self.disconnect_reason = "TCP 安全策略等待超过 2 秒"
                 await self.close()
                 print(f"[TCP] Connection failed: {self.disconnect_reason}")
                 return False
@@ -402,7 +403,7 @@ class GameSocket:
 
         if msg_type == MSG_TYPE_EXT:
             try:
-                message = Amf3Reader(body[1:]).read_object()
+                message = decode_amf3(body[1:])
             except (EOFError, ValueError, IndexError, struct.error) as exc:
                 raise ValueError(
                     f"服务端 AMF3 消息解析失败：type={msg_type}, bytes={len(body)}"
@@ -642,10 +643,28 @@ class GameSocket:
                 (seq & 0x1FFFFFFC) >> 2,
             )
 
-            inner = build_xt_request(
-                ext_id, cmd, params, seq, effective_room_id, encrypt
-            )
-            await self._send_raw_locked(inner)
+            fields = {'ext_id': ext_id, 'cmd': cmd, 'room_id': effective_room_id}
+            self._trace_message('send_start', **fields, params=params)
+            try:
+                inner = build_xt_request(
+                    ext_id, cmd, params, seq, effective_room_id, encrypt
+                )
+                await self._send_raw_locked(inner)
+            except asyncio.CancelledError:
+                self._trace_message('send_cancelled', **fields, outcome='unknown')
+                raise
+            except Exception as error:
+                self._trace_message('send_failed', **fields,
+                                    reason=f'{type(error).__name__}: {error}')
+                raise
+            self._trace_message('send_returned', **fields, outcome='local_write_returned')
+
+    def _trace_message(self, event, **fields):
+        if self.message_trace is not None:
+            try:
+                self.message_trace(event, **fields)
+            except Exception:
+                logger.exception('发送消息日志记录失败')
 
     async def send_and_recv(self, ext_id: int, cmd: str, params: dict,
                             room_id: int = -1, timeout: float = 10.0) -> dict | None:
@@ -749,6 +768,7 @@ async def login_and_connect(
     proxy_url: str | None = None,
     network_mode: str = "legacy",
     tcp_retry_window: float | None = None,
+    single_attempt: bool = False,
 ) -> GameSocket | None:
     """TCP/WSS login; a retry window selects TCP only and retries before sending login."""
     if network_mode == "system":
@@ -760,18 +780,19 @@ async def login_and_connect(
         # 策略 2: 原始 TCP (Flash port)
         tcp_port = zone.flash_port or zone.port
         connected = (await _connect_tcp_with_retry(sock, zone.host, tcp_port, timeout, tcp_retry_window)
-                     if tcp_retry_window is not None else await sock.connect_tcp(zone.host, tcp_port, timeout))
+                     if tcp_retry_window is not None and not single_attempt
+                     else await sock.connect_tcp(zone.host, tcp_port, timeout))
         if connected:
             resp = await sock.login(
                 f"{zone.zone_index} {zone.zone_name}",
                 user_id, session_id
             )
-            if resp is not None and (tcp_retry_window is None or resp.get('_cmd') == 'logOK'):
+            if resp is not None and ((tcp_retry_window is None and not single_attempt) or resp.get('_cmd') == 'logOK'):
                 retained = True
                 return sock
             await sock.close()
 
-        if tcp_retry_window is not None:
+        if tcp_retry_window is not None or single_attempt:
             return None
 
         # 策略 1: WebSocket (H5 domain:port)

@@ -16,9 +16,10 @@ ScriptRunner = Callable[[AppContext], Awaitable[None | tuple[SendResult, ...]]]
 
 
 class ScriptExecutionError(RuntimeError):
-    def __init__(self, message: str, send_results: tuple[SendResult, ...]) -> None:
+    def __init__(self, message: str, send_results: tuple[SendResult, ...], *, step_results=()) -> None:
         super().__init__(message)
         self.send_results = send_results
+        self.step_results = step_results
 
 
 @dataclass(frozen=True)
@@ -42,9 +43,8 @@ def _load_script(module_name: str) -> InteractionScript:
     )
 
 
-def discover_scripts(directory: Path | None = None) -> list[InteractionScript]:
+def script_module_names(directory: Path | None = None):
     scripts_dir = directory or RESOURCE_ROOT / "scripts"
-    discovered = []
     for path in sorted(scripts_dir.glob("*.py")):
         if (
             path.name == "__init__.py"
@@ -53,7 +53,12 @@ def discover_scripts(directory: Path | None = None) -> list[InteractionScript]:
             or path.stem == "verify"
         ):
             continue
-        module_name = f"scripts.{path.stem}"
+        yield f"scripts.{path.stem}"
+
+
+def discover_scripts(directory: Path | None = None) -> list[InteractionScript]:
+    discovered = []
+    for module_name in script_module_names(directory):
         try:
             discovered.append(_load_script(module_name))
         except TypeError:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,13 +10,14 @@ from typing import Sequence
 
 from src.messaging.parser import SendMessage
 from src.game.battle.control import (
-    BattleRoundSkipped, BattleStateError, abort_round, note_sent,
+    BattleRoundSkipped, BattleStateError, abort_round, before_send,
     current_round, wait_for_match, wait_for_end, wait_for_entry, ENTRY_TIMEOUT_SECONDS,
 )
 from src.network.context import AppContext
 
 
 DEFAULT_MESSAGE_DELAY = 0.2
+logger = logging.getLogger(__name__)
 _BATTLE_RESPONSE_TIMEOUT = ENTRY_TIMEOUT_SECONDS
 _BATTLE_ENTRY_COMMAND = (15, "54_22")
 _ROOM_JOIN_COMMAND = (1, "cmdCreateAndJoinRoom")
@@ -118,12 +120,15 @@ async def end_previous_battle(context: AppContext, delay: float = 0) -> None:
         except BaseException:
             battle.end_request_sent = False
             raise
-        _context_log(context, "已提交上一场战斗结束 1404")
+        logger.debug("已提交上一场战斗结束 1404")
         if delay > 0:
             await asyncio.sleep(delay)
         if battle.last_error:
             raise RuntimeError(battle.last_error)
-        battle.finish_without_confirmation()
+        if battle.match_pending:
+            await wait_for_end(context)
+        else:
+            battle.finish_without_confirmation()
     elif battle.phase in {"entering", "unknown"}:
         await abort_round(context, battle.last_error or f"当前战斗状态为 {battle.phase}")
 
@@ -243,15 +248,15 @@ def _assert_automation_allowed(context: AppContext) -> None:
         callback()
 
 
-async def _execute_instruction(context: AppContext, message: SendMessage) -> None:
+async def _execute_instruction(context: AppContext, message: SendMessage, *, check=None) -> None:
     if message.cmd == "#time":
         seconds = message.param["seconds"]
-        _context_log(context, f"暂停 {seconds:g} 秒")
+        logger.debug("暂停 %g 秒", seconds)
         await asyncio.sleep(seconds)
         _assert_automation_allowed(context)
         return
 
-    await wait_for_end(context)
+    await wait_for_end(context, check=check)
 
 
 
@@ -322,8 +327,8 @@ class _BattleExecutor:
             params = _escape_params(self.context, params)
             self.context.battle.mark_end_requested()
         try:
+            before_send(self.context, item.message.cmd)
             await self.context.socket.send_xt_message(item.message.id, item.message.cmd, params)
-            note_sent(self.context, item.message.cmd)
         except Exception:
             if item.message.cmd == "1404":
                 self.context.battle.end_request_sent = False
@@ -391,7 +396,7 @@ class _BattleExecutor:
         if self.entry_item is None or self.state is None:
             raise BattleStateError("尚未发送 54_22 战斗入口")
         self.failure_item = self.entry_item
-        _context_log(self.context, "等待战斗入口 2303/2401/2426/2402")
+        logger.debug("等待战斗入口 2303/2401/2426/2402")
         await wait_for_entry(self.context, self.subscription, self.previous_epoch)
         self.state.battle_id = self.context.battle.battle_id
         self.state.current_turn = self.context.battle.current_turn
@@ -400,7 +405,7 @@ class _BattleExecutor:
         self.subscription = None
         self.results[self.entry_item.index] = _make_result(
             self.account_label, self.sequence_start, self.entry_item, True)
-        _context_log(self.context, f"战斗已就绪：battleId={self.state.battle_id}, turn={self.state.current_turn}")
+        logger.debug("战斗已就绪：battleId=%s, turn=%s", self.state.battle_id, self.state.current_turn)
 
     async def _ensure_external_entry_ready(self, item: _MessageItem) -> None:
         self.failure_item = item
@@ -423,7 +428,7 @@ class _BattleExecutor:
         try:
             await self.context.wait_for_player_initialization()
             _assert_automation_allowed(self.context)
-            _context_log(self.context, "玩家资料已就绪；等待房间")
+            logger.debug("玩家资料已就绪；等待房间")
             if not self.plan.has_entry:
                 self.subscription = self.context.messages.subscribe(max_queue_size=500)
             for step_index, step in enumerate(self.plan.steps):
@@ -450,10 +455,7 @@ class _BattleExecutor:
                         self.results[step.item.index] = _make_result(
                             self.account_label, self.sequence_start, step.item, True
                         )
-                    _context_log(
-                        self.context,
-                        f"已进入动态房间 {step.room_name}（roomId={room_id}）",
-                    )
+                    logger.debug("已进入动态房间 %s（roomId=%s）", step.room_name, room_id)
                     if step_index + 1 < len(self.plan.steps):
                         await self._pause()
                     continue
@@ -473,7 +475,7 @@ class _BattleExecutor:
                     self.context.battle.begin_entry(room_id)
                     self.entry_started = True
                     await self._send(step.item)
-                    _context_log(self.context, "已提交 54_22；等待入口辅助消息")
+                    logger.debug("已提交 54_22；等待入口辅助消息")
                     if step_index + 1 < len(self.plan.steps):
                         await self._pause()
                     continue
@@ -558,10 +560,10 @@ async def _execute_simple_plan(
             elif isinstance(step, _LocalInstruction):
                 await _execute_instruction(context, item.message)
             else:
+                before_send(context, item.message.cmd)
                 await context.socket.send_xt_message(
                     item.message.id, item.message.cmd, dict(item.message.param)
                 )
-                note_sent(context, item.message.cmd)
         except BattleRoundSkipped as exc:
             exc.prepend(results)
             raise
@@ -624,6 +626,7 @@ async def execute_messages(
     sequence_start: int = 1,
     *,
     preserve_current_battle: bool = False,
+    check=None,
 ) -> list[SendResult]:
     """Preflight the full sequence; #wait separates independent battle plans."""
     operations: list[tuple[int, _DispatchPlan | _LocalInstruction]] = []
@@ -651,7 +654,7 @@ async def execute_messages(
         for operation_index, (start, operation) in enumerate(operations):
             if isinstance(operation, _LocalInstruction):
                 try:
-                    await _execute_instruction(context, operation.item.message)
+                    await _execute_instruction(context, operation.item.message, check=check)
                 except BattleRoundSkipped:
                     raise
                 except asyncio.CancelledError:

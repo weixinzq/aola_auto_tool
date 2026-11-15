@@ -7,7 +7,6 @@ from typing import Awaitable, Callable
 
 from src.network.context import AppContext
 from src.accounts.session import open_context
-from src.accounts.browser_login import BrowserLoginStopped
 from src.accounts.login import LoginBlockedError
 
 
@@ -132,11 +131,6 @@ class AccountConnection:
             except asyncio.CancelledError:
                 self.state = "已取消"
                 raise
-            except BrowserLoginStopped as exc:
-                self.last_error = str(exc)
-                self.state = "验证未完成"
-                self.retryable = False
-                return False
             except LoginBlockedError as exc:
                 self.last_error = str(exc)
                 self.login_block_reason = exc.reason

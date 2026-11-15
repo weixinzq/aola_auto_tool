@@ -51,7 +51,7 @@ class Redactor:
             for item in value:
                 self.collect(item)
 
-    def clean(self, value: object) -> str:
+    def clean(self, value: object, *, redact_global: bool = True) -> str:
         text = str(value)
         for secret in sorted(self.values, key=len, reverse=True):
             text = text.replace(secret, "[redacted]")
@@ -64,7 +64,7 @@ class Redactor:
             r"\1[redacted]\2", text,
         )
         redact = getattr(self.store, "redact", None)
-        return redact(text) if redact is not None else text
+        return redact(text) if redact_global and redact is not None else text
 
 
 @dataclass
@@ -279,12 +279,9 @@ class SessionService:
         self._claim_accounts = {key: owner for key, owner in self._claim_accounts.items() if owner != task_id}
 
     def _log(self, session: _Session, message: object) -> None:
-        message = session.redactor.clean(message)
-        task_id = self._claims.get(session.identity)
-        if task_id is not None and self.on_log is not None:
-            self.on_log(task_id, session.account_id, message)
-        else:
-            self.events.publish("log", {"account_id": session.account_id, "task_id": None, "message": message})
+        task_id = self._claim_accounts.get(session.account_id) or session.owner_task_id
+        if task_id and self.on_log:
+            self.on_log(task_id, session.account_id, session.redactor.clean(message, redact_global=False))
 
     def _observe_disconnect(self, session: _Session, reason: str) -> None:
         if session.state in {"offline", "disconnecting"}:

@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import { computed, ref, toRef, watch } from 'vue'
 import AccountPagination from './AccountPagination.vue'
+import ScriptParameters from './ScriptParameters.vue'
+import { scriptParams, type ParameterDraft } from '../scriptParams'
 import { useAccountPagination } from '../accountPagination'
 import { send } from '../api'
 import type { Account, Script, Session, TaskRecord, Step, MessagesValidation } from '../types'
 
 const props = withDefaults(defineProps<{ accounts: Account[]; scripts: Script[]; selectedIds: string[]; sessions?: Session[] }>(), { sessions: () => [] })
 const emit = defineEmits<{ created: [taskId: string]; failure: [error: unknown] }>()
-type Draft = { key: number; kind: 'messages' | 'script'; text: string; scriptId: string; repeat: number; filename: string }
+type Draft = { key: number; kind: 'messages' | 'script'; text: string; scriptId: string; repeat: number; filename: string; params: ParameterDraft[] }
 const ids = ref([...props.selectedIds])
 const mode = ref<'script' | 'combination'>('script')
 const scriptId = ref('')
+const parameters = ref<ParameterDraft[]>([])
 const steps = ref<Draft[]>([])
 const repetitions = ref(1)
 const repeatInterval = ref(0.5)
@@ -27,12 +30,13 @@ watch(() => props.accounts, value => {
   const existing = new Set(value.map(a => a.account_id)); ids.value = ids.value.filter(id => existing.has(id))
 })
 watch([steps, repetitions, repeatInterval, messageDelay], () => { checked.value = '' }, { deep: true })
+watch(scriptId, () => { parameters.value = []; error.value = '' })
 
 function toggle(id: string, value: boolean) {
   ids.value = value ? [...new Set([...ids.value, id])] : ids.value.filter(item => item !== id)
 }
 function add(kind: Draft['kind']) {
-  steps.value.push({ key: ++nextKey, kind, text: '', scriptId: '', repeat: 1, filename: '' })
+  steps.value.push({ key: ++nextKey, kind, text: '', scriptId: '', repeat: 1, filename: '', params: [] })
   error.value = ''
 }
 function move(index: number, offset: number) {
@@ -57,7 +61,10 @@ async function buildSteps(): Promise<Step[]> {
     let value: Step
     if (step.kind === 'script') {
       if (!step.scriptId) throw new Error(`请选择第 ${index + 1} 步的专用脚本`)
-      value = { kind: 'script', script_id: step.scriptId }
+      try {
+        const params = scriptParams(step.params)
+        value = { kind: 'script', script_id: step.scriptId, ...(step.params.length ? { params } : {}) }
+      } catch (cause) { throw new Error(`第 ${index + 1} 步：${cause instanceof Error ? cause.message : '参数无效'}`) }
     } else {
       if (!step.text.trim()) throw new Error(`请填写第 ${index + 1} 步的消息`)
       try {
@@ -81,7 +88,9 @@ async function submit() {
   busy.value = true; error.value = ''
   try {
     const account_ids = [...ids.value]
-    const body = mode.value === 'script' ? { account_ids, script_id: scriptId.value } : {
+    const body = mode.value === 'script' ? (parameters.value.length ? {
+      account_ids, steps: [{ kind: 'script', script_id: scriptId.value, params: scriptParams(parameters.value) }],
+    } : { account_ids, script_id: scriptId.value }) : {
       account_ids, steps: await buildSteps(), repetitions: repetitions.value,
       repeat_interval: repeatInterval.value, message_delay: messageDelay.value,
     }
@@ -98,7 +107,11 @@ async function submit() {
     <section class="panel composition" aria-label="任务编排">
       <div class="panel-heading"><div><p class="eyebrow">01 · BUILD</p><h2>编排任务</h2></div><div class="mode-switch" role="group" aria-label="任务类型"><button type="button" :aria-pressed="mode === 'script'" :class="{ active: mode === 'script' }" :disabled="busy" @click="mode = 'script'">专用任务</button><button type="button" :aria-pressed="mode === 'combination'" :class="{ active: mode === 'combination' }" :disabled="busy" @click="mode = 'combination'">组合任务</button></div></div>
       <div class="composition-body">
-        <label v-if="mode === 'script'" class="field single-script">执行脚本<select v-model="scriptId" required aria-label="执行脚本" :disabled="busy"><option value="" disabled>请选择脚本</option><option v-for="script in scripts" :key="script.script_id" :value="script.script_id">{{ script.name }}</option></select></label>
+        <template v-if="mode === 'script'">
+          <label class="field single-script">执行脚本<select v-model="scriptId" required aria-label="执行脚本" :disabled="busy"><option value="" disabled>请选择脚本</option><option v-for="script in scripts" :key="script.script_id" :value="script.script_id">{{ script.name }}</option></select></label>
+          <p v-if="scriptId" class="help">{{ scripts.find(script => script.script_id === scriptId)?.description }}</p>
+          <ScriptParameters v-if="scriptId" v-model="parameters" :disabled="busy" />
+        </template>
         <template v-else>
 
           <ol class="composition-steps">
@@ -108,7 +121,11 @@ async function submit() {
                 <label class="field">消息内容<textarea v-model="step.text" :aria-label="`第${index + 1}步消息内容`" rows="4" spellcheck="false" :disabled="busy" placeholder='#send={"id":21,"param":{"ed":false,"mi":60,"tp":2,"qt":1,"posud":false},"cmd":"buyMaterial"}|' /></label>
                 <div class="message-tools"><label class="file-button">导入消息文件<input type="file" accept=".txt,text/plain" :aria-label="`导入第${index + 1}步消息文件`" :disabled="busy" @change="importFile(step, $event)" /></label><span>支持粘贴多条 #send 消息，也可导入 .txt 后继续编辑。</span></div>
               </template>
-              <label v-else class="field">执行脚本<select v-model="step.scriptId" :aria-label="`第${index + 1}步专用脚本`" :disabled="busy"><option value="" disabled>请选择脚本</option><option v-for="script in scripts" :key="script.script_id" :value="script.script_id">{{ script.name }}</option></select></label>
+              <template v-else>
+                <label class="field">执行脚本<select v-model="step.scriptId" :aria-label="`第${index + 1}步专用脚本`" :disabled="busy" @change="step.params = []"><option value="" disabled>请选择脚本</option><option v-for="script in scripts" :key="script.script_id" :value="script.script_id">{{ script.name }}</option></select></label>
+                <p v-if="step.scriptId" class="help">{{ scripts.find(script => script.script_id === step.scriptId)?.description }}</p>
+                <ScriptParameters v-if="step.scriptId" v-model="step.params" :label="`第${index + 1}步参数`" :disabled="busy" />
+              </template>
               <label class="step-repeat">此步骤执行<input v-model.number="step.repeat" type="number" min="1" step="1" required :aria-label="`第${index + 1}步执行次数`" :disabled="busy" />次</label>
             </li>
           </ol>

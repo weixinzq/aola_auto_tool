@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.network.context import AppContext
+
+logger = logging.getLogger(__name__)
 
 
 class AutoBattle:
     def __init__(self, context: AppContext) -> None:
         self.context = context
         self.enabled = False
+        self.extra_action_delay_seconds = 0.0
         self.players: dict[int, dict] = {}  # Field slot -> player; one owner may occupy several slots.
         self.turn_message: dict | None = None
         self.sent_turns: set[tuple[int, int, int]] = set()
@@ -264,6 +268,8 @@ class AutoBattle:
         sent = False
         action = "自动换宠" if cmd == "1403" else "自动待机" if cmd == "1406" else "自动出手"
         try:
+            if self.extra_action_delay_seconds > 0:
+                await asyncio.sleep(self.extra_action_delay_seconds)
             if (
                 not self.enabled
                 or not self.context.socket.connected
@@ -281,11 +287,11 @@ class AutoBattle:
             await self.context.socket.send_xt_message(13, cmd, params)
             sent = True
             if cmd == "1403":
-                self.context.log(f"自动换宠：位置 {key[2]}，背包第 {self.backpack_order[params['pmId']] + 1} 位，已提交上场请求")
+                logger.debug("自动换宠：位置 %s，背包第 %s 位，已提交上场请求", key[2], self.backpack_order[params['pmId']] + 1)
             elif cmd == "1406":
-                self.context.log(f"自动待机：第 {key[1] + 1} 回合，位置 {key[2]}，无可用技能")
+                logger.debug("自动待机：第 %s 回合，位置 %s，无可用技能", key[1] + 1, key[2])
             else:
-                self.context.log(f"自动出手：第 {key[1] + 1} 回合，位置 {key[2]}，技能 {params['skillId']}")
+                logger.debug("自动出手：第 %s 回合，位置 %s，技能 %s", key[1] + 1, key[2], params['skillId'])
         except Exception as exc:
             self.context.log(f"{action}失败：位置 {key[2]}，{exc}")
         finally:

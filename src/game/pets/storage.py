@@ -4,10 +4,12 @@ from __future__ import annotations
 RESPONSE_TIMEOUT_SECONDS = 30.0
 
 
-async def find_storage_i(context, r: int) -> int:
-    """在关键词 5856 的第 1 页结果中，返回首条 r 匹配记录的 i。"""
+async def find_storage_i(context, r: int, *, keyword: str = "5856") -> int:
+    """在指定关键词的第 1 页结果中，返回首条 r 匹配记录的 i。"""
     if type(r) is not int:
         raise ValueError("参数 r 必须是整数，例如 {\"r\": 6000}")
+    if not isinstance(keyword, str):
+        raise ValueError("参数 keyword 必须是文本，例如 {\"keyword\": \"5856\"}")
 
     await context.wait_for_player_initialization()
     subscription = context.messages.subscribe()
@@ -15,11 +17,11 @@ async def find_storage_i(context, r: int) -> int:
         await context.socket.send_xt_message(
             13, "1226", {
                 "label": [-1, -1, -1],
-                "stars": ["GQ"],
+                "stars": [""],
                 "order": 1,
                 "race": [],
                 "page": 1,
-                "kw": "5856",
+                "kw": keyword,
                 "nsk": False,
                 "sys": "",
                 "elitePM": 0,
@@ -29,7 +31,7 @@ async def find_storage_i(context, r: int) -> int:
             },
         )
         response = await subscription.wait_for(
-            lambda message: message.get("_cmd") == "1226",
+            lambda message: str(message.get("_cmd")) == "1226",
             timeout=RESPONSE_TIMEOUT_SECONDS,
         )
     finally:

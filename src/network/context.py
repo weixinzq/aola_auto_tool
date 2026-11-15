@@ -141,6 +141,7 @@ class MessageRouter:
         self._observers: set[MessageObserver] = set()
         self._disconnect_observers: set[DisconnectObserver] = set()
         self.message_filter: Callable[[dict], bool] | None = None
+        self.message_trace: Callable[..., None] | None = None
         self._task: asyncio.Task[None] | None = None
         self.disconnected = asyncio.Event()
         self.disconnect_reason = ""
@@ -187,25 +188,32 @@ class MessageRouter:
 
     def publish(self, message: dict) -> None:
         """Publish one decoded message to all current subscribers."""
-        if self.message_filter is not None and self.message_filter(message):
+        filtered = self.message_filter is not None and self.message_filter(message)
+        if self.message_trace is not None:
+            try:
+                self.message_trace(message, filtered=filtered)
+            except Exception:
+                logger.exception('接收消息日志记录失败')
+        if filtered:
             return
         cmd = str(message.get("_cmd", ""))
-        if cmd in _INITIALIZATION_TRACE_COMMANDS:
+        if cmd in _INITIALIZATION_TRACE_COMMANDS and logger.isEnabledFor(logging.INFO):
             logger.info(
                 "RX INIT: cmd=%s keys=%s",
                 cmd,
                 ",".join(sorted(str(key) for key in message)),
             )
         if _is_battle_trace_message(message):
-            logger.info(
-                "RX BATTLE: %s",
-                json.dumps(
-                    message,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    default=_battle_trace_json_default,
-                ),
-            )
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "RX BATTLE: %s",
+                    json.dumps(
+                        message,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=_battle_trace_json_default,
+                    ),
+                )
             _append_battle_receive_trace(message)
         for observer in tuple(self._observers):
             try:
@@ -252,6 +260,8 @@ class MessageRouter:
                     observer(self.disconnect_reason)
                 except Exception:
                     logger.exception("disconnect observer failed")
+
+
 
 
 class SessionClock:
@@ -326,6 +336,7 @@ class AppContext:
     battle: BattleLifecycle = field(init=False)
     auto_battle: AutoBattle = field(init=False)
     session_clock: SessionClock = field(init=False)
+    battle_message_log: object | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.battle = BattleLifecycle()
@@ -343,6 +354,32 @@ class AppContext:
         """Emit one user-facing script message when a UI logger is attached."""
         if self.log_callback is not None:
             self.log_callback(str(message))
+
+    def battle_diagnostics(self, callback):
+        from src.game.battle.diagnostics import capture
+        return capture(self, callback)
+
+    def enable_battle_message_log(self, script_name):
+        from src.game.battle.control import current_round
+        from src.game.battle.message_log import BattleMessageLog
+        scope = current_round(self)
+        number = scope.repetition if scope is not None else 1
+        recorder = self.battle_message_log
+        created = recorder is None
+        if created:
+            try:
+                recorder = self.battle_message_log = BattleMessageLog(self)
+            except OSError as error:
+                self.log(f'[收发日志] 无法创建日志文件：{error}')
+                return None
+        if recorder.closed:
+            return None
+        recorder.start_round(script_name, number)
+        if recorder.closed:
+            return None
+        if created or number == 1:
+            self.log(f'[收发日志] 文件：{recorder.path}；持续记录到账号断开')
+        return recorder.path
 
     def _observe_message(self, message: dict) -> None:
         self.battle.observe(message)
@@ -385,9 +422,7 @@ class AppContext:
             getattr(socket, "active_room_name", "") == room_name
             and getattr(socket, "active_room_id", -1) > 0
         ):
-            self.log(
-                f"复用动态房间 {room_name}（roomId={socket.active_room_id}）"
-            )
+            logger.debug("复用动态房间 %s（roomId=%s）", room_name, socket.active_room_id)
             return
 
         # A new join attempt invalidates the previous room context until the
@@ -472,4 +507,6 @@ class AppContext:
         self.messages.remove_observer(self._observe_message)
         self.messages.remove_disconnect_observer(self._observe_disconnect)
         await self.messages.stop()
+        if self.battle_message_log is not None:
+            self.battle_message_log.close()
         await self.socket.close()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -128,7 +129,7 @@ class TaskService:
             run.publish_handle.cancel()
             run.publish_handle = None
         self.store.save_task(run.record)
-        self.events.publish("task", self.store.get_task(run.record["task_id"]))
+        self.events.publish("task", self.store.get_task_summary(run.record["task_id"]))
 
     def _publish(self, run: _Run) -> None:
         # Coalesce account transitions so a large batch does not synchronously
@@ -141,7 +142,7 @@ class TaskService:
     def _log(self, task_id: str, account_id: str | None, message: str) -> None:
         run = self._runs.get(task_id)
         if run is not None:
-            message = run.redactor.clean(message)
+            message = run.redactor.clean(message, redact_global=False)
         row = self.store.append_log(task_id, account_id, message)
         self.events.publish("log", row)
 
@@ -183,7 +184,7 @@ class TaskService:
         return self.get(task_id)
 
     def list(self) -> list[dict]:
-        return self.store.list_tasks()
+        return self.store.list_task_summaries()
 
     def clear_finished(self) -> dict:
         task_ids = [record["task_id"] for record in self.list()
@@ -219,6 +220,11 @@ class TaskService:
         if run is None:
             raise ServiceError("task_unavailable", "任务不属于当前运行进程", 409)
         if run.stop_reason is None:
+            if any(getattr(step, 'script_id', None) == 'double_auto_battle' for step in run.spec.steps):
+                self._log(task_id, None, '[匹配计时]' + json.dumps({
+                    'script': 'double_auto_battle', 'event': 'task_cancel_requested',
+                    'task_id': task_id, 'source': 'task_manager.cancel',
+                }, separators=(',', ':')))
             run.stop_reason = "cancelled"
             run.record["state"] = "cancelling"
             self._publish(run)
@@ -235,6 +241,8 @@ class TaskService:
         self._log(run.record["task_id"], row["account_id"], message)
 
     async def _connect(self, run: _Run, account: dict, row: dict) -> None:
+        if run.spec.login_once:
+            account = {**account, "login_once": True}
         row["state"] = "connecting"
         self._publish(run)
         await self.sessions.connect(run.record["task_id"], account,
@@ -255,27 +263,54 @@ class TaskService:
         options = dict(repetitions=run.spec.repetitions, repeat_interval=run.spec.repeat_interval,
                        message_delay=run.spec.message_delay,
                        preserve_current_battle=run.spec.session_policy != "temporary")
+        streamed = hasattr(self.store, "append_task_steps")
+        first_error = None
+
+        def save_steps(records):
+            nonlocal first_error
+            for step in records:
+                if step["error"]:
+                    if first_error is None and not step.get("skipped", False):
+                        first_error = step["error"]
+                    step["error"] = run.redactor.clean(step["error"])
+            self.store.append_task_steps(run.record["task_id"], account_id, records)
+
+        async def save_local_steps(records):
+            save_steps(records)
+            await asyncio.sleep(0)
+
+        if streamed:
+            # Pending batches stay private until execution returns its final audit.
+            row["_step_results_streamed"] = False
         try:
             remote = getattr(context, "execute_steps", None)
             if remote is not None:
-                await remote([step.model_dump(mode="json") for step in run.spec.steps], outcome, **options)
+                await remote([step.model_dump(mode="json") for step in run.spec.steps], outcome,
+                             **({"on_steps": save_steps} if streamed else {}), **options)
             else:
-                await run_execution(account_id, context, run.steps, outcome, executor=self.executor, **options)
+                await run_execution(account_id, context, run.steps, outcome, executor=self.executor,
+                                    on_steps=save_local_steps if streamed else None, **options)
+        except BaseException:
+            row.pop("_step_results_streamed", None)
+            raise
         finally:
             row["network_write"] = outcome["network_write"]
         row["completed_repetitions"] = outcome["completed_repetitions"]
         row["attempted_repetitions"] = outcome.get("attempted_repetitions", row["completed_repetitions"])
         row["skipped_repetitions"] = outcome.get("skipped_repetitions", 0)
         row["state"] = "succeeded" if outcome["success"] else "failed"
-        row["step_results"] = [
-            {**step, "error": run.redactor.clean(step["error"]) if step["error"] else None}
-            for step in outcome["step_results"]
-        ]
+        if streamed:
+            row["_step_results_streamed"] = True
+        else:
+            row["step_results"] = [
+                {**step, "error": run.redactor.clean(step["error"]) if step["error"] else None}
+                for step in outcome["step_results"]
+            ]
         if not outcome["success"]:
             errors = [step["error"] for step in outcome["step_results"]
                       if step["error"] and not step.get("skipped", False)]
             row["error"] = {"code": "execution_failed",
-                            "message": run.redactor.clean(errors[0] if errors else "任务未完整执行")}
+                            "message": run.redactor.clean(first_error or (errors[0] if errors else "任务未完整执行"))}
 
     async def _one(self, run: _Run, account: dict, row: dict, semaphore, *, prepare_only=False):
         task_id = run.record["task_id"]

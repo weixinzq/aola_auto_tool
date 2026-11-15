@@ -340,3 +340,10 @@ class TraitsInfo:
 
     def get_property(self, index: int) -> str:
         return self.properties[index] if index < len(self.properties) else ""
+
+
+try:
+    from ._amf3_native import decode as decode_amf3
+except ImportError:
+    def decode_amf3(data: bytes) -> Any:
+        return Amf3Reader(data).read_object()

@@ -1,14 +1,12 @@
-"""Private pipe worker. It owns game contexts, never the service database."""
+"""Isolated worker with a dedicated control channel and account contexts."""
 import argparse
 import asyncio
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import ipaddress
 import json
-import logging
 import os
 from pathlib import Path
-import sys
 
 import aiohttp
 from pydantic import TypeAdapter
@@ -19,6 +17,7 @@ from src.service.execution import MessageService, ScriptRegistry
 from src.service.execution_runner import run_execution
 from src.service.runtime import Redactor
 from src.service.worker_process import actual_executable, bind_linux_parent
+from src.service.worker_transport import open_worker_connection
 from src.network.server_probe import probe_server, transport_result
 
 
@@ -43,14 +42,13 @@ class WorkerHost:
         self.connections = {}
         self.probing = set()
         self.commands = {}
-        self.registry = ScriptRegistry(MessageService())
+        self.registry = ScriptRegistry(MessageService(), lazy=True)
         self.redactor = Redactor(None)
         self.account_scope = ContextVar("worker_account", default=None)
-        self.output = sys.stdout
+        self.control_writer = None
 
     def write(self, message):
-        self.output.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
-        self.output.flush()
+        self.control_writer.write((json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
 
     def log(self, message, account_id=None):
         self.write({"event": "log", "account_id": account_id or self.account_scope.get(),
@@ -140,7 +138,16 @@ class WorkerHost:
         if operation == "execute":
             self.redactor.collect(data["steps"])
             steps = self.registry.build_steps(TypeAdapter(list[StepSpec]).validate_python(data["steps"]))
-            await run_execution(account_id, context, steps, outcome, **data["options"])
+            async def send_steps(records):
+                for step in records:
+                    if step["error"]:
+                        step["error"] = self.redactor.clean(step["error"])
+                self.write({"event": "steps", "request_id": command["id"], "steps": records})
+                await self.control_writer.drain()
+                await asyncio.sleep(0)
+
+            await run_execution(account_id, context, steps, outcome,
+                                on_steps=send_steps if data.get("stream_results") else None, **data["options"])
             for step in outcome.get("step_results", []):
                 if step["error"]:
                     step["error"] = self.redactor.clean(step["error"])
@@ -163,23 +170,12 @@ class WorkerHost:
         finally:
             self.account_scope.reset(token)
             self.commands.pop(request_id, None)
+        await self.control_writer.drain()
 
-    async def run(self):
-        host = self
-
-        class SafeOutput:
-            def write(self, text):
-                if text.strip():
-                    host.log(text.rstrip())
-                return len(text)
-
-            def flush(self):
-                pass
-
-        sys.stdout = sys.stderr = SafeOutput()
-        logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
+    async def run(self, reader, writer):
+        self.control_writer = writer
         try:
-            while line := await asyncio.to_thread(sys.stdin.buffer.readline):
+            while line := await reader.readline():
                 command = json.loads(line)
                 task = asyncio.create_task(self.handle(command))
                 self.commands[command["id"]] = task
@@ -188,14 +184,22 @@ class WorkerHost:
                 task.cancel()
             await asyncio.gather(*list(self.commands.values()), return_exceptions=True)
             await asyncio.gather(*(connection.disconnect() for connection in self.connections.values()), return_exceptions=True)
+            writer.close()
+            await writer.wait_closed()
 
 
-def main(connection_factory=AccountConnection):
+def main(connection_factory=AccountConnection, *, host_factory=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--parent-pid", type=int, required=True)
     arguments = parser.parse_args()
     bind_linux_parent(arguments.parent_pid)
-    asyncio.run(WorkerHost(connection_factory).run())
+
+    async def run():
+        reader, writer = await open_worker_connection()
+        host = host_factory() if host_factory is not None else WorkerHost(connection_factory)
+        await host.run(reader, writer)
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

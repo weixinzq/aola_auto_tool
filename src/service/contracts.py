@@ -109,6 +109,7 @@ class ServerTarget(InputModel):
 
 
 class TaskSpec(InputModel):
+    login_once: bool = False
     kind: Literal["connect", "reconnect", "disconnect", "execute", "server_probe"] = "execute"
     account_ids: list[str] = Field(min_length=1)
     session_policy: Literal["existing", "temporary", "pooled"] = "pooled"
@@ -170,6 +171,7 @@ class TaskSpec(InputModel):
 
 
 class ScriptTaskInput(InputModel):
+    login_once: bool = False
     account_ids: list[str] = Field(min_length=1)
     script_id: str | None = Field(default=None, min_length=1)
     steps: list[StepSpec] | None = Field(default=None, min_length=1)
@@ -192,5 +194,6 @@ class ScriptTaskInput(InputModel):
 
     def to_spec(self):
         return TaskSpec(account_ids=self.account_ids, session_policy="pooled", concurrency=len(self.account_ids),
+                        login_once=self.login_once,
                         steps=self.steps if self.steps is not None else [ScriptStepSpec(kind="script", script_id=self.script_id)],
                         repetitions=self.repetitions, repeat_interval=self.repeat_interval, message_delay=self.message_delay)

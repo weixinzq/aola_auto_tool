@@ -1,0 +1,2 @@
+"""Local CAPTCHA recognition ."""
+

@@ -6,7 +6,7 @@ import json
 from src.messaging.dispatcher import validate_messages
 from src.messaging.parser import SendMessage, parse_pipe_separated_messages, parse_send_message
 from src.scripting.composer import MessageBatchStep, ScriptStep
-from src.scripting.loader import discover_scripts
+from src.scripting.loader import discover_scripts, script_module_names, _load_script
 from src.service.contracts import MessageSpec, ServiceError
 
 
@@ -72,7 +72,14 @@ class ScriptContext:
         return self._context.auto_battle
 
     def log(self, message):
+        """Publish an explicit script message without requiring a text prefix."""
         self._context.log(message)
+
+    def battle_diagnostics(self, callback):
+        return self._context.battle_diagnostics(callback)
+
+    def enable_battle_message_log(self, script_name):
+        return self._context.enable_battle_message_log(script_name)
 
     def assert_automation_allowed(self):
         self._context.assert_automation_allowed()
@@ -119,12 +126,30 @@ class ScriptMessages:
 
 
 class ScriptRegistry:
-    def __init__(self, messages):
+    def __init__(self, messages, *, lazy=False):
         self.messages = messages
-        self._scripts = {script.module_name.removeprefix("scripts."): script for script in discover_scripts()}
+        self._scripts = {} if lazy else {
+            script.module_name.removeprefix("scripts."): script for script in discover_scripts()}
+        self._modules = {name.removeprefix("scripts."): name for name in script_module_names()} if lazy else {}
 
     def list(self):
-        return [{"script_id": key, "name": script.name, "description": script.description} for key, script in self._scripts.items()]
+        for key in self._modules:
+            try:
+                self._load(key)
+            except ServiceError:
+                continue
+        return [{"script_id": key, "name": self._scripts[key].name,
+                 "description": self._scripts[key].description} for key in sorted(self._scripts)]
+
+    def _load(self, key):
+        if key not in self._scripts and key in self._modules:
+            try:
+                self._scripts[key] = _load_script(self._modules[key])
+            except TypeError:
+                raise ServiceError("unknown_script", "专用脚本不存在") from None
+        if key not in self._scripts:
+            raise ServiceError("unknown_script", "专用脚本不存在")
+        return self._scripts[key]
 
     def build_steps(self, steps):
         result = []
@@ -133,9 +158,7 @@ class ScriptRegistry:
                 validated = self.messages.validate(step.messages)
                 result.append(MessageBatchStep(tuple(self.messages.decode(item) for item in validated["messages"])))
             else:
-                if step.script_id not in self._scripts:
-                    raise ServiceError("unknown_script", "专用脚本不存在")
-                script = self._scripts[step.script_id]
+                script = self._load(step.script_id)
 
                 async def run(context, runner=script.run, params=deepcopy(step.params)):
                     return await runner(ScriptContext(context, params))

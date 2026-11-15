@@ -1,6 +1,7 @@
 """Account-local battle identity, entry readiness, and lifecycle state."""
 from __future__ import annotations
 
+import math
 from collections import deque
 
 
@@ -8,6 +9,7 @@ class BattleLifecycle:
     """Persistent battle gate for one logged-in account."""
 
     def __init__(self) -> None:
+        self.diagnostic_callback = None
         self.phase = "idle"
         self.battle_epoch = 0
         self.battle_id: int | None = None
@@ -24,6 +26,33 @@ class BattleLifecycle:
         self._abandoned_ids = deque(maxlen=64)
         self._abandoned_unique_ids = deque(maxlen=64)
         self._ignore_orphans = False
+        # Matching outlives an execution round, including local timeouts/cancellation.
+        self.match_pending = False
+        self.match_reply: dict | None = None
+        self.match_deadline: float | None = None
+        self.prepare_deadline: float | None = None
+        self.match_epoch: int | None = None
+        self.match_cancel_requested = False
+        self.match_cancelled = False
+        # Settlement can arrive after 2403 or between script executions.
+        self.settlement_serial = 0
+        self.settlement_pending = False
+        self.settlement_reply: dict | None = None
+        self.settlement_ambiguous = False
+        self.require_match_settlement = False
+
+    def clear_match(self) -> None:
+        self.match_pending = False
+        self.match_reply = None
+        self.match_deadline = None
+        self.prepare_deadline = None
+        self.match_epoch = None
+        self.match_cancel_requested = False
+        self.match_cancelled = False
+
+    def discard_match_settlement(self) -> None:
+        self.settlement_pending = False
+        self.settlement_reply = None
 
     def is_stale(self, message: dict) -> bool:
         if message.get("battleId") is not None and message["battleId"] in self._abandoned_ids:
@@ -57,6 +86,7 @@ class BattleLifecycle:
     def begin_entry(self, room_id: int) -> None:
         if self.phase in {"entering", "unknown"}:
             raise RuntimeError(f"当前战斗状态为 {self.phase}，不能提交新的 54_22")
+        self.match_cancelled = False
         if self.battle_unique_id is not None:
             self._retired_battle_unique_id = self.battle_unique_id
         self._unconfirmed_battle = None
@@ -105,6 +135,41 @@ class BattleLifecycle:
         if self.is_stale(message):
             return
         cmd = str(message.get("_cmd", ""))
+        if cmd == "SA231229_CmdMatch":
+            if self.match_reply is None:
+                self.settlement_serial += 1
+                if self.settlement_pending:
+                    self.settlement_ambiguous = True
+                self.settlement_pending = True
+                self.settlement_reply = None
+            self.match_cancelled = False
+            if self.match_epoch is None:
+                self.match_epoch = self.battle_epoch
+            self.match_pending = True
+            self.match_reply = dict(message)
+            return
+        if cmd == "SA231229_fe":
+            if self.settlement_pending and not self.settlement_ambiguous and all(
+                not isinstance(message.get(key), bool)
+                and isinstance(message.get(key), (int, float))
+                and (not isinstance(message[key], float) or math.isfinite(message[key]))
+                for key in ("sc", "hsc", "wstc")
+            ):
+                self.settlement_reply = dict(message)
+                self.settlement_pending = False
+            return
+        if cmd == "SA231229_match":
+            # These replies reject the request; a success already observed wins.
+            if message.get("r") in (-9, -10) and self.match_reply is None and self.phase == "idle":
+                self.match_pending = False
+            return
+        if cmd == "SA231229_cancle":
+            if (message.get("r") == 1 and self.match_cancel_requested
+                    and self.phase == "idle" and self.battle_epoch == self.match_epoch):
+                self.discard_match_settlement()
+                self.clear_match()
+                self.match_cancelled = True
+            return
         if self.phase == "idle" and self._unconfirmed_battle is not None and cmd in {
             "2405", "2411", "2402", "2423"
         }:
@@ -136,6 +201,11 @@ class BattleLifecycle:
                     self.mark_unknown(f"2303 未返回有效 battleId：{battle_id!r}")
                 return
             if self.phase in {"idle", "entering"}:
+                if self.match_cancelled or self.match_epoch == self.battle_epoch:
+                    # Actual entry wins over a preceding cancellation/rejection reply.
+                    self.match_cancelled = False
+                    self.match_pending = True
+                    self.match_epoch = self.battle_epoch
                 if self.phase == "idle":
                     self._unconfirmed_battle = None
                     self.entry_responses.clear()
@@ -181,6 +251,7 @@ class BattleLifecycle:
                 unique_id is None or unique_id == self._unconfirmed_battle[1]
             ):
                 self._unconfirmed_battle = None
+                self.clear_match()
             if unique_id is not None and (
                 unique_id == self._retired_battle_unique_id
                 or (
@@ -190,10 +261,11 @@ class BattleLifecycle:
             ):
                 return
             if self.phase in {"entering", "active", "ending"}:
+                self.clear_match()
+                self._retired_battle_unique_id = self.battle_unique_id or unique_id
                 self.phase = "idle"
                 self.battle_id = None
                 self.battle_unique_id = None
-                self._retired_battle_unique_id = None
                 self.end_request_sent = False
                 self.current_turn = None
                 self.room_id = None

@@ -20,7 +20,7 @@ from src.service.contracts import AccountInput, AccountPatch, EgressAssignment, 
 from src.interfaces.schemas import (
     AccountImportResult, AccountRecord, TaskClearResult, ErrorResponse, HealthStatus,
     LogEntry, MessagesValidation, ScriptRecord, SessionRecord, TaskPreflight,
-    TaskRecord, TaskResults, EgressGroupRecord, EgressRules, EgressAssignmentResult,
+    TaskRecord, TaskSummary, TaskResults, EgressGroupRecord, EgressRules, EgressAssignmentResult,
 )
 
 
@@ -233,7 +233,7 @@ def create_app(
             raise ServiceError("invalid_task", "仅支持服务器探测")
         return await request.app.state.application.tasks.submit(body)
 
-    @api.get("/tasks", response_model=list[TaskRecord])
+    @api.get("/tasks", response_model=list[TaskSummary])
     async def tasks(request: Request):
         return request.app.state.application.tasks.list()
 
@@ -274,6 +274,8 @@ def create_app(
                         event = await asyncio.wait_for(queue.get(), timeout=15)
                     except asyncio.TimeoutError:
                         yield ": keepalive\n\n"
+                        continue
+                    if event["event"] == "log" and not task_id:
                         continue
                     payload = jsonable_encoder(event)
                     event_task_id = payload.get("task_id") or payload.get("data", {}).get("task_id")

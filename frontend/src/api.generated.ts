@@ -976,6 +976,34 @@ export interface components {
             /** Probe Staggered */
             probe_staggered?: boolean | null;
         };
+        /** TaskSummary */
+        TaskSummary: {
+            /** Task Id */
+            task_id: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "interrupted";
+            error: components["schemas"]["ErrorInfo"] | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "connect" | "reconnect" | "disconnect" | "execute" | "server_probe";
+            /** Created At */
+            created_at: string;
+            /** Updated At */
+            updated_at?: string | null;
+            /** Started At */
+            started_at: string | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Account Count */
+            account_count: number;
+            /** Skipped Repetitions */
+            skipped_repetitions: number;
+        };
         /** TransportProbeResult */
         TransportProbeResult: {
             /** Status */
@@ -2831,7 +2859,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TaskRecord"][];
+                    "application/json": components["schemas"]["TaskSummary"][];
                 };
             };
             /** @description Bad Request */

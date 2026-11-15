@@ -57,6 +57,12 @@ class CombinationStepResult:
 
 
 @dataclass(frozen=True)
+class StepExecutionResult:
+    step_results: tuple[CombinationStepResult, ...]
+    send_results: tuple[SendResult, ...]
+
+
+@dataclass(frozen=True)
 class CombinationResult:
     requested_repetitions: int
     completed_repetitions: int
@@ -91,6 +97,94 @@ def _validate_options(
         raise ValueError("每轮间隔必须是大于或等于 0 的有限秒数")
 
 
+async def execute_steps(
+    account_label: str,
+    context: AppContext,
+    steps: Sequence[CombinationStep],
+    message_delay: float = DEFAULT_MESSAGE_DELAY,
+    *,
+    preserve_current_battle: bool = False,
+    sequence_start: int = 1,
+    check=None,
+) -> StepExecutionResult:
+    """Execute once; failures, round skips and cancellation escape to the caller.
+
+    Direct script calls get a temporary battle scope, never a repetition loop.
+    Step records use local repetition 1; the combination owner assigns its round.
+    """
+    steps = tuple(steps)
+    _validate_options(steps, 1, 0)
+    token = begin_round(context, 1) if current_round(context) is None else None
+    step_results: list[CombinationStepResult] = []
+    send_results: list[SendResult] = []
+    next_message_sequence = sequence_start
+    step_number = 1
+    try:
+        for step_number, step in enumerate(steps, start=1):
+            kind = "message_batch" if isinstance(step, MessageBatchStep) else "script"
+            error = ""
+            sends = ()
+            try:
+                if check is not None:
+                    check()
+                assert_allowed = getattr(context, "assert_automation_allowed", None)
+                if callable(assert_allowed):
+                    assert_allowed()
+                if isinstance(step, MessageBatchStep):
+                    sends = await execute_messages(
+                        account_label, context, step.messages, delay=message_delay,
+                        sequence_start=next_message_sequence,
+                        preserve_current_battle=preserve_current_battle, check=check)
+                    if len(sends) != len(step.messages):
+                        error = "通用消息批次未完整执行"
+                elif isinstance(step, ScriptStep):
+                    sends = await step.script.run(context) or ()
+                else:
+                    raise TypeError(f"不支持的组合步骤类型：{type(step).__name__}")
+                if check is not None:
+                    check()
+            except BattleRoundSkipped as exc:
+                exc.prepend(sends)
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, ScriptExecutionError):
+                    sends = exc.send_results
+            for item in sends:
+                send_results.append(replace(item, account_label=account_label,
+                                            sequence=next_message_sequence))
+                next_message_sequence += 1
+            failure = next((item for item in sends if not item.success), None)
+            if failure is not None:
+                error = failure.error or "脚本消息发送失败"
+            step_results.append(CombinationStepResult(
+                1, step_number, kind, step.description, not error, error))
+            if error:
+                raise ScriptExecutionError(error, tuple(send_results), step_results=tuple(step_results))
+            if step_number < len(steps) and message_delay > 0:
+                await asyncio.sleep(message_delay)
+        return StepExecutionResult(tuple(step_results), tuple(send_results))
+    except BattleRoundSkipped as exc:
+        for item in exc.send_results:
+            send_results.append(replace(item, account_label=account_label,
+                                        sequence=next_message_sequence))
+            next_message_sequence += 1
+        for number in range(step_number, len(steps) + 1):
+            step = steps[number - 1]
+            step_results.append(CombinationStepResult(
+                1, number, "message_batch" if isinstance(step, MessageBatchStep) else "script",
+                step.description, False,
+                str(exc) if number == step_number else "本轮已恢复跳过", skipped=True))
+        exc.send_results = tuple(send_results)
+        exc.step_results = tuple(step_results)
+        raise
+    finally:
+        if token is not None:
+            reset_round(token)
+
+
 async def execute_combination(
     account_label: str,
     context: AppContext,
@@ -100,15 +194,28 @@ async def execute_combination(
     message_delay: float = DEFAULT_MESSAGE_DELAY,
     *,
     preserve_current_battle: bool = False,
+    _on_round=None,
 ) -> CombinationResult:
-    """Execute ordered steps, then wait and repeat the complete combination."""
+    """Own repetitions; the service may consume each round without retaining it."""
     steps = tuple(steps)
     _validate_options(steps, repetitions, repeat_interval)
     owner = current_round(context) is None
+    if _on_round is not None and not owner:
+        raise ValueError("只有外层轮次执行可以分批收集结果")
     step_results: list[CombinationStepResult] = []
     send_results: list[SendResult] = []
     completed_repetitions = skipped_repetitions = 0
-    next_message_sequence = 1
+    sent_count = 0
+
+    async def collect(outcome, repetition):
+        nonlocal sent_count
+        records = tuple(replace(step, repetition=repetition) for step in outcome.step_results)
+        sent_count += len(outcome.send_results)
+        if _on_round is None:
+            step_results.extend(records)
+            send_results.extend(outcome.send_results)
+        else:
+            await _on_round(StepExecutionResult(records, outcome.send_results))
 
     def result():
         return CombinationResult(repetitions, completed_repetitions, tuple(step_results),
@@ -116,65 +223,21 @@ async def execute_combination(
 
     for repetition in range(1, repetitions + 1):
         token = begin_round(context, repetition) if owner else None
-        step_number = 1
         try:
-            for step_number, step in enumerate(steps, start=1):
-                kind = "message_batch" if isinstance(step, MessageBatchStep) else "script"
-                error = ""
-                sends = ()
-                try:
-                    assert_allowed = getattr(context, "assert_automation_allowed", None)
-                    if callable(assert_allowed):
-                        assert_allowed()
-                    if isinstance(step, MessageBatchStep):
-                        sends = await execute_messages(
-                            account_label, context, step.messages, delay=message_delay,
-                            sequence_start=next_message_sequence,
-                            preserve_current_battle=preserve_current_battle)
-                        if len(sends) != len(step.messages):
-                            error = "通用消息批次未完整执行"
-                    elif isinstance(step, ScriptStep):
-                        sends = await step.script.run(context) or ()
-                    else:
-                        raise TypeError(f"不支持的组合步骤类型：{type(step).__name__}")
-                except BattleRoundSkipped:
-                    raise
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-                    if isinstance(exc, ScriptExecutionError):
-                        sends = exc.send_results
-                for item in sends:
-                    send_results.append(replace(item, account_label=account_label,
-                                                sequence=next_message_sequence))
-                    next_message_sequence += 1
-                failure = next((item for item in sends if not item.success), None)
-                if failure is not None:
-                    error = failure.error or "脚本消息发送失败"
-                step_results.append(CombinationStepResult(
-                    repetition, step_number, kind, step.description, not error, error))
-                if error:
-                    return result()
-                if step_number < len(steps) and message_delay > 0:
-                    await asyncio.sleep(message_delay)
+            outcome = await execute_steps(account_label, context, steps, message_delay,
+                                          preserve_current_battle=preserve_current_battle,
+                                          sequence_start=sent_count + 1)
+            await collect(outcome, repetition)
             completed_repetitions += 1
+        except ScriptExecutionError as exc:
+            await collect(exc, repetition)
+            return result()
         except BattleRoundSkipped as exc:
-            for item in exc.send_results:
-                send_results.append(replace(item, account_label=account_label,
-                                            sequence=next_message_sequence))
-                next_message_sequence += 1
+            await collect(exc, repetition)
             if not owner:
                 exc.send_results = tuple(send_results)
                 raise
             skipped_repetitions += 1
-            for number in range(step_number, len(steps) + 1):
-                step = steps[number - 1]
-                step_results.append(CombinationStepResult(
-                    repetition, number,
-                    "message_batch" if isinstance(step, MessageBatchStep) else "script",
-                    step.description, False,
-                    str(exc) if number == step_number else "本轮已恢复跳过", skipped=True))
         finally:
             if token is not None:
                 reset_round(token)

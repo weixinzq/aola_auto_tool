@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Column, Integer, JSON, MetaData, String, Table, create_engine, select, event
+from sqlalchemy import Column, Integer, JSON, MetaData, String, Table, create_engine, select, event, func
 
 from src.service.contracts import ServiceError
 from src.service.events import utc_now
@@ -23,6 +23,9 @@ egress_groups = Table("egress_groups", metadata, Column("group_id", String, prim
 logs = Table("logs", metadata, Column("id", Integer, primary_key=True, autoincrement=True),
              Column("task_id", String, index=True), Column("account_id", String),
              Column("timestamp", String, nullable=False), Column("message", String, nullable=False))
+task_step_batches = Table("task_step_batches", metadata, Column("id", Integer, primary_key=True),
+                          Column("task_id", String, nullable=False), Column("account_id", String, nullable=False),
+                          Column("records", JSON, nullable=False))
 _SECRET_KEYS = {"password", "sid", "session_id", "session-id", "token", "authorization", "secret", "loginkey"}
 _GENERATED_FIELDS = {"task_id", "account_id", "account_ids", "script_id", "created_at", "updated_at",
                      "started_at", "finished_at", "timestamp", "state", "kind", "mode", "session_policy",
@@ -148,8 +151,12 @@ class Store:
     def save_task(self, record):
         # Task parameters are already replaced by _snapshot. Preserve generated
         # identifiers/enums even when a password is a single character.
-        record = self.redact(deepcopy(record), task_record=True)
+        record = self.redact(record, task_record=True)
         with self.engine.begin() as connection:
+            streamed = [row["account_id"] for row in record.get("account_results", [])
+                        if "_step_results_streamed" in row]
+            connection.execute(task_step_batches.delete().where(task_step_batches.c.task_id == record["task_id"],
+                                                                task_step_batches.c.account_id.not_in(streamed)))
             exists = connection.execute(select(tasks.c.task_id).where(tasks.c.task_id == record["task_id"])).first()
             if exists:
                 connection.execute(tasks.update().where(tasks.c.task_id == record["task_id"]).values(record=record))
@@ -159,14 +166,55 @@ class Store:
     def get_task(self, task_id):
         with self.engine.connect() as connection:
             row = connection.execute(select(tasks.c.record).where(tasks.c.task_id == task_id)).first()
-        if row is None:
-            raise ServiceError("not_found", "任务不存在", 404)
-        return deepcopy(row[0])
+            if row is None:
+                raise ServiceError("not_found", "任务不存在", 404)
+            return self._task_details(row[0], connection)
+
+    def append_task_steps(self, task_id, account_id, records):
+        with self.engine.begin() as connection:
+            connection.execute(task_step_batches.insert().values(task_id=task_id, account_id=account_id,
+                records=self.redact(records, task_record=True)))
+
+    def _task_details(self, record, connection):
+        targets = {}
+        for row in record.get("account_results", []):
+            if row.pop("_step_results_streamed", False):
+                row["step_results"] = []
+                targets[row["account_id"]] = row["step_results"]
+        if targets:
+            query = select(task_step_batches.c.account_id, task_step_batches.c.records).where(
+                task_step_batches.c.task_id == record["task_id"],
+                task_step_batches.c.account_id.in_(targets)).order_by(task_step_batches.c.id)
+            for account_id, records in connection.execute(query):
+                targets[account_id].extend(records)
+        return record
 
     def list_tasks(self):
         with self.engine.connect() as connection:
-            records = [deepcopy(row[0]) for row in connection.execute(select(tasks.c.record))]
+            records = [self._task_details(row[0], connection) for row in connection.execute(select(tasks.c.record))]
         return sorted(records, key=lambda item: item.get("created_at", ""), reverse=True)
+
+    def _task_summary_query(self):
+        fields = ("task_id", "kind", "state", "created_at", "updated_at", "started_at", "finished_at", "error")
+        rows = func.json_each(tasks.c.record, "$.account_results").table_valued("value")
+        skipped = select(func.sum(func.json_extract(rows.c.value, "$.skipped_repetitions"))).select_from(rows).correlate(tasks).scalar_subquery()
+        return select(
+            *(tasks.c.record[name].label(name) for name in fields),
+            func.coalesce(func.json_array_length(tasks.c.record, "$.account_results"), 0).label("account_count"),
+            func.coalesce(skipped, 0).label("skipped_repetitions"),
+        )
+
+    def list_task_summaries(self):
+        query = self._task_summary_query().order_by(tasks.c.record["created_at"].as_string().desc())
+        with self.engine.connect() as connection:
+            return [dict(row) for row in connection.execute(query).mappings()]
+
+    def get_task_summary(self, task_id):
+        with self.engine.connect() as connection:
+            row = connection.execute(self._task_summary_query().where(tasks.c.task_id == task_id)).mappings().first()
+        if row is None:
+            raise ServiceError("not_found", "任务不存在", 404)
+        return dict(row)
 
     def interrupt_pending(self):
         for record in self.list_tasks():
@@ -181,6 +229,7 @@ class Store:
         if not task_ids:
             return
         with self.engine.begin() as connection:
+            connection.execute(task_step_batches.delete().where(task_step_batches.c.task_id.in_(task_ids)))
             connection.execute(logs.delete().where(logs.c.task_id.in_(task_ids)))
             connection.execute(tasks.delete().where(tasks.c.task_id.in_(task_ids)))
 

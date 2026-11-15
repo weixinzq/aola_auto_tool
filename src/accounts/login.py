@@ -12,11 +12,12 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 import aiohttp
 from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
 
-from src.accounts.browser_login import browser_login, is_captcha_page
+from src.accounts.browser_login import is_captcha_page
 from src.config import PROJECT_ROOT, load_user_config, default_config
 
 @dataclass
@@ -67,6 +68,7 @@ class LoginResult:
     server_list: list[ServerEndpoint] = field(default_factory=list)
     http_stage: str = ""
     http_status: int | None = None
+    retry_after: float = 0.0
 
 
 class LoginBlockedError(ConnectionError):
@@ -315,7 +317,7 @@ async def http_login(
     network_mode: str = "legacy",
     diagnostic_dir: Optional[str] = None,
 ) -> LoginResult:
-    """Query the configured role and return the selected role's login result."""
+    """Query the configured role. Legacy browser_verification is ignored."""
     conf = {} if network_mode == "system" else load_user_config()
     request_timeout = aiohttp.ClientTimeout(
         total=float(timeout if timeout is not None else conf.get("timeout", 30))
@@ -383,9 +385,14 @@ async def http_login(
             stage, request_url, response, response_body, result.error_msg, account, password,
             **({"diagnostic_dir": diagnostic_dir} if diagnostic_dir is not None else {}),
         )
-        if browser_verification and is_captcha_page(response_body.decode("utf-8", errors="replace")):
-            if effective_proxy:
-                return result  # The headless worker must not open a direct browser.
-            print(f"[登录验证] {result.error_msg}", flush=True)
-            return await browser_login(account, password, char_id, login_url, register_url)
+        if result.blocked_reason and response is not None:
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                result.retry_after = max(0.0, float(int(retry_after)))
+            except (ValueError, OverflowError):
+                try:
+                    deadline = parsedate_to_datetime(retry_after)
+                    result.retry_after = max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    pass
     return result
