@@ -39,12 +39,12 @@ async function showRules() {
 </script>
 <template>
   <div class="page-heading"><div><p class="eyebrow">IP POOL</p><h1>IP 池</h1><p>{{ occupied }} 个名额占用 · {{ capacity }} 个可用出口容量 · {{ waitingCount }} 个账号等待出口</p></div><button class="button secondary" @click="showRules">生成 Clash 规则</button></div>
-  <div class="notice"><strong>添加出口</strong><p>在 Clash 配置节点 → 登记出口 → 部署进程规则 → 检测 → 确认规则 → 启用。直连也是一个出口，需要相应 DIRECT 规则。</p><p>每个公网 IP 最多 25 个账号。停用只停止新分配，现有连接继续保留。启用新出口后，等待账号自动继续。</p></div>
+  <div class="notice"></div>
   <section v-if="rules" class="panel pool-form"><p>{{ rules.instructions }}</p><textarea :value="rules.yaml" readonly rows="8" aria-label="Clash 规则片段" /></section>
   <section class="panel"><form class="pool-form" @submit.prevent="save"><h2>{{ editing ? '编辑出口' : '添加出口' }}</h2>
     <div class="field-row"><label class="field">出口名称<input v-model="form.name" required maxlength="80" /></label><label class="field">出口类型<select v-model="direct" aria-label="出口类型"><option value="proxy">Clash 代理</option><option value="direct">服务器直连</option></select></label><label v-if="direct === 'proxy'" class="field">Clash 节点名称<input v-model="form.clash_policy" required maxlength="120" /></label></div>
     <label v-if="editing"><input v-model="form.routing_confirmed" type="checkbox" />已部署本出口进程规则并核对出口</label>
-    <p class="help">新出口默认停用。修改路由前应先停用并等待所有连接断开，修改后重新检测、确认和启用。</p>
+
     <div class="button-row"><button class="button primary" :disabled="!!busy">{{ editing ? '保存出口' : '添加出口' }}</button><button v-if="editing" type="button" class="text-button" @click="edit()">取消编辑</button></div>
   </form></section>
   <section class="panel"><h2 class="pool-form">全部出口 · {{ groups.length }}</h2><p v-if="!groups.length" class="pool-form">尚未添加出口，连接请求将等待。</p>

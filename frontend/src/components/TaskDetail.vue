@@ -23,9 +23,8 @@ const skipped = computed(() => props.task.account_results.filter(a => a.state ==
     <div class="panel-heading"><div><p class="eyebrow">TASK DETAIL</p><h2>任务详情 <span class="badge" :class="task.state === 'succeeded' && recovered ? 'working' : tone(task.state)">{{ task.state === 'succeeded' && recovered ? '完成，含跳过' : label(task.state) }}</span></h2></div><button class="icon-button" aria-label="关闭任务详情" @click="$emit('close')">×</button></div>
     <div class="detail-summary"><div><span>任务编号</span><code>{{ task.task_id }}</code></div><div><span>创建时间</span><strong>{{ time(task.created_at) }}</strong></div><div><span>账号完成</span><strong>{{ completed }} / {{ task.account_results.length }}</strong></div><button v-if="isActive(task.state)" class="button danger" :disabled="cancelling || task.state === 'cancelling' && task.error?.code !== 'cleanup_failed'" @click="$emit('cancel')">{{ cancelling ? '正在取消与清理…' : task.error?.code === 'cleanup_failed' ? '重试取消' : task.state === 'cancelling' ? '正在取消与清理…' : '取消任务' }}</button></div>
     <div v-if="task.error" class="notice error" role="alert"><strong>{{ label(task.error.code) }}</strong> · {{ task.error.message }}</div>
-    <div v-if="skipped.length" class="notice" role="status"><strong>{{ skipped.length }} 个账号已跳过</strong><p>{{ skipped.map(result => name(result.account_id)).join('、') }}。其余账号的执行结果见下表。</p></div>
+    <div v-if="skipped.length" class="notice" role="status"><strong>{{ skipped.length }} 个账号已跳过</strong><p>{{ skipped.map(result => name(result.account_id)).join('、') }}</p></div>
     <h3>逐账号结果</h3>
-    <p class="help">本地网络写入与服务器业务确认分别展示；未知表示尚无业务确认。</p>
     <nav v-if="resultPages > 1" class="button-row" aria-label="结果分页">
       <button class="button secondary small" :disabled="resultPage <= 1" @click="resultPage--">上一页</button>
       <span>第 {{ resultPage }} / {{ resultPages }} 页 · 每页 50 个账号</span>
