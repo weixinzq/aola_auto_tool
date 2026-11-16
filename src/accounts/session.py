@@ -35,8 +35,8 @@ async def authenticate(config: dict) -> tuple[LoginResult, ZoneData]:
             register_url=config.get("register_url"),
             browser_verification=False,
             timeout=float(config.get("timeout", 30)),
-            **({"network_mode": "system", "diagnostic_dir": config.get("diagnostic_dir")}
-               if config.get("network_mode") == "system" else {}),
+            **({"network_mode": config["network_mode"], "diagnostic_dir": config.get("diagnostic_dir")}
+               if config.get("network_mode") in {"system", "proxy"} else {}),
             **({"proxy_url": config["proxy_url"]} if config.get("proxy_url") else {}),
         )
         if result.success:
@@ -201,7 +201,7 @@ async def open_context(config: dict) -> AppContext:
         timeout=float(config.get("timeout", 2)),
         tcp_retry_window=10.0,
         **({"single_attempt": True} if config.get("login_once") else {}),
-        **({"network_mode": "system"} if config.get("network_mode") == "system" else {}),
+        **({"network_mode": config["network_mode"]} if config.get("network_mode") in {"system", "proxy"} else {}),
         **({"proxy_url": config["proxy_url"]} if config.get("proxy_url") else {}),
     )
     if socket is None:

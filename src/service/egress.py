@@ -15,6 +15,9 @@ class EgressService:
 
     def get(self, group_id):
         group = self.store.get_egress_group(group_id)
+        if self.workers.mihomo:
+            group['routing_confirmed'] = group['clash_policy'] == 'DIRECT' or (
+                self.workers.mihomo.state == 'ready' and group['clash_policy'] in self.workers.mihomo.nodes)
         profile = self.workers.profile(group_id)
         return {**group, "max_online": 25, "enabled": group.get("enabled", False),
                 **profile, **self.sessions.egress_usage(group_id),
@@ -52,6 +55,9 @@ class EgressService:
 
     def create(self, value):
         value = value if isinstance(value, EgressGroupInput) else EgressGroupInput.model_validate(value)
+        if self.workers.mihomo:
+            self.workers.mihomo.validate_policy(value.clash_policy)
+            value = value.model_copy(update={'routing_confirmed': True})
         if value.enabled:
             raise ServiceError("egress_unconfirmed", "新出口须先检测并确认后启用", 409)
         if any(group["name"] == value.name for group in self.list()):
@@ -62,6 +68,23 @@ class EgressService:
         self.events.publish("egress", {"group_id": group_id})
         return self.get(group_id)
 
+    def import_nodes(self):
+        groups = self.store.list_egress_groups()
+        policies = {group['clash_policy'] for group in groups}
+        names = {group['name'] for group in groups}
+        for node in self.workers.mihomo.nodes:
+            if node not in policies:
+                name, suffix = node, 2
+                while name in names:
+                    name = f'{node[:70]} ({suffix})'
+                    suffix += 1
+                self.create({'name': name, 'clash_policy': node})
+                names.add(name)
+
+    def runtime(self):
+        return self.workers.mihomo.status() if self.workers.mihomo else {
+            'mode': 'external', 'state': 'external', 'nodes': [], 'pid': None}
+
     def _idle(self, group_id):
         if self.sessions.egress_usage(group_id)["online_count"]:
             raise ServiceError("egress_busy", "出口仍有连接或正在清理，请先停用并断开", 409)
@@ -69,12 +92,15 @@ class EgressService:
     async def update(self, group_id, value):
         original = self.check(group_id)
         value = value if isinstance(value, EgressGroupInput) else EgressGroupInput.model_validate(value)
+        if self.workers.mihomo:
+            self.workers.mihomo.validate_policy(value.clash_policy)
+            value = value.model_copy(update={'routing_confirmed': True})
         if any(g["name"] == value.name and g["group_id"] != group_id for g in self.list()):
             raise ServiceError("egress_duplicate", "出口名称已存在", 409)
         route_changed = original["clash_policy"] != value.clash_policy
         if route_changed:
             self._idle(group_id)
-            value = value.model_copy(update={"routing_confirmed": False, "enabled": False})
+            value = value.model_copy(update={"routing_confirmed": bool(self.workers.mihomo), "enabled": False})
         self._enable_check(group_id, value)
         self._changing.add(group_id)
         try:
@@ -110,6 +136,9 @@ class EgressService:
 
     async def probe(self, group_id):
         self.check(group_id)
+        if self.workers.mihomo:
+            group = self.store.get_egress_group(group_id)
+            self.workers.mihomo.proxy_url(group['clash_policy'])
         self._idle(group_id)
         self._verified.discard(group_id)
         self._changing.add(group_id)
@@ -117,7 +146,7 @@ class EgressService:
             result = await self.workers.probe(group_id)
             self.workers.worker(group_id).exit_ip = str(ip_address(result["exit_ip"]))
             self._verified.add(group_id)
-            group = self.store.get_egress_group(group_id)
+            group = self.get(group_id)
             self._enable_check(group_id, EgressGroupInput.model_validate(
                 {k: v for k, v in group.items() if k in EgressGroupInput.model_fields}))
         except BaseException:
@@ -129,6 +158,8 @@ class EgressService:
         return self.get(group_id)
 
     def rules(self):
+        if self.workers.mihomo:
+            return {'yaml': '', 'instructions': '项目已托管 Mihomo，无需外部进程分流规则。'}
         rules = [f"PROCESS-PATH,{prepare_worker_executable(self.store.directory, g['group_id'])},{g['clash_policy']}"
                  for g in self.store.list_egress_groups()]
         return {"yaml": yaml.safe_dump({"mode": "rule", "find-process-mode": "strict", "rules": rules},

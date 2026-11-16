@@ -90,7 +90,9 @@ async def _probe_once(config, target, timeout, outcome, redactor, transport, ste
                     login = await http_login(config["account"], config["password"],
                         char_id=config.get("char_id", 0), login_url=config.get("login_url"),
                         register_url=config.get("register_url"), browser_verification=False,
-                        network_mode="system", timeout=timeout, diagnostic_dir=config.get("diagnostic_dir"))
+                        network_mode=config.get('network_mode', 'system'), timeout=timeout,
+                        diagnostic_dir=config.get("diagnostic_dir"),
+                        **({'proxy_url': config['proxy_url']} if config.get('proxy_url') else {}))
                 authenticated_at = now()
             row["stage_durations_ms"]["authenticate"] = round((monotonic() - stage_started) * 1000, 1)
             redactor.add(login.session_id)
@@ -127,7 +129,8 @@ async def _probe_once(config, target, timeout, outcome, redactor, transport, ste
             stage_started = monotonic()
             if authentication_cache is not None:
                 authentication_cache["authenticated"] = (login, authenticated_at)
-            socket = GameSocket(login.session_id, network_mode="system")
+            socket = GameSocket(login.session_id, network_mode=config.get('network_mode', 'system'),
+                                **({'proxy_url': config['proxy_url']} if config.get('proxy_url') else {}))
             async with asyncio.timeout(phase_timeout()):
                 connected = await (socket.connect_tcp(server.host, server.flash_port, timeout)
                     if transport == "flash" else socket.connect_ws(server.domain, server.h5_port, timeout))

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { request, send } from '../api'
 import { time } from '../presentation'
-import type { EgressGroup, EgressRules } from '../types'
+import type { EgressGroup, EgressRules, ProxyRuntime } from '../types'
 const props = withDefaults(defineProps<{ groups: EgressGroup[]; waitingCount?: number }>(), { waitingCount: 0 })
 const emit = defineEmits<{ changed: []; failure: [error: unknown] }>()
 const editing = ref<string | null>(null)
@@ -10,6 +10,11 @@ const direct = ref('proxy')
 const form = ref({ name: '', clash_policy: '', routing_confirmed: false, enabled: false })
 const busy = ref('')
 const rules = ref<EgressRules | null>(null)
+const runtime = ref<ProxyRuntime | null>(null)
+const managed = computed(() => runtime.value?.mode === 'managed')
+watch(() => props.groups, async () => {
+  try { runtime.value = await request<ProxyRuntime>('/egress-groups/runtime') } catch (cause) { emit('failure', cause) }
+}, { immediate: true })
 const capacity = computed(() => props.groups.filter(g => g.active).length * 25)
 const occupied = computed(() => props.groups.reduce((sum, g) => sum + g.online_count, 0))
 function edit(group?: EgressGroup) {
@@ -38,12 +43,12 @@ async function showRules() {
 }
 </script>
 <template>
-  <div class="page-heading"><div><p class="eyebrow">IP POOL</p><h1>IP 池</h1><p>{{ occupied }} 个名额占用 · {{ capacity }} 个可用出口容量 · {{ waitingCount }} 个账号等待出口</p></div><button class="button secondary" @click="showRules">生成 Clash 规则</button></div>
+  <div class="page-heading"><div><p class="eyebrow">IP POOL</p><h1>IP 池</h1><p>{{ occupied }} 个名额占用 · {{ capacity }} 个可用出口容量 · {{ waitingCount }} 个账号等待出口</p><p v-if="managed">独立 Mihomo · {{ runtime?.state === 'ready' ? '运行中' : '未运行' }}</p></div><button v-if="!managed" class="button secondary" @click="showRules">生成 Clash 规则</button></div>
   <div class="notice"></div>
   <section v-if="rules" class="panel pool-form"><p>{{ rules.instructions }}</p><textarea :value="rules.yaml" readonly rows="8" aria-label="Clash 规则片段" /></section>
   <section class="panel"><form class="pool-form" @submit.prevent="save"><h2>{{ editing ? '编辑出口' : '添加出口' }}</h2>
-    <div class="field-row"><label class="field">出口名称<input v-model="form.name" required maxlength="80" /></label><label class="field">出口类型<select v-model="direct" aria-label="出口类型"><option value="proxy">Clash 代理</option><option value="direct">服务器直连</option></select></label><label v-if="direct === 'proxy'" class="field">Clash 节点名称<input v-model="form.clash_policy" required maxlength="120" /></label></div>
-    <label v-if="editing"><input v-model="form.routing_confirmed" type="checkbox" />已部署本出口进程规则并核对出口</label>
+    <div class="field-row"><label class="field">出口名称<input v-model="form.name" required maxlength="80" /></label><label class="field">出口类型<select v-model="direct" aria-label="出口类型"><option value="proxy">{{ managed ? '独立代理' : 'Clash 代理' }}</option><option value="direct">服务器直连</option></select></label><label v-if="direct === 'proxy'" class="field">代理节点<select v-if="managed" v-model="form.clash_policy" required aria-label="代理节点"><option disabled value="">选择节点</option><option v-for="node in runtime?.nodes" :key="node" :value="node">{{ node }}</option></select><input v-else v-model="form.clash_policy" required maxlength="120" /></label></div>
+    <label v-if="editing && !managed"><input v-model="form.routing_confirmed" type="checkbox" />已部署本出口进程规则并核对出口</label>
 
     <div class="button-row"><button class="button primary" :disabled="!!busy">{{ editing ? '保存出口' : '添加出口' }}</button><button v-if="editing" type="button" class="text-button" @click="edit()">取消编辑</button></div>
   </form></section>

@@ -51,6 +51,12 @@ class Worker:
                 if self.pool.job is None:
                     self.pool.job = WorkerJob()
                 environment = worker_environment()
+                environment.pop('AOLA_PROXY_URL', None)
+                if self.pool.mihomo:
+                    policy = self.pool.store.get_egress_group(self.group_id)['clash_policy']
+                    proxy_url = self.pool.mihomo.proxy_url(policy)
+                    if proxy_url:
+                        environment['AOLA_PROXY_URL'] = proxy_url
                 environment.update({PORT_ENV: str(listener.port), TOKEN_ENV: listener.token})
                 self.process = await asyncio.create_subprocess_exec(
                     str(executable), "-u", "-B", "-m", self.pool.module, "--parent-pid", str(os.getpid()),
@@ -322,12 +328,14 @@ class RemoteAccountConnection:
 
 
 class WorkerPool:
-    def __init__(self, store, events, *, module="src.service.worker_host", local_factory=AccountConnection):
+    def __init__(self, store, events, *, module="src.service.worker_host", local_factory=AccountConnection,
+                 mihomo=None):
         self.store, self.directory, self.events = store, store.directory, events
         self.module, self.local_factory = module, local_factory
         self.workers = {}
         self.job = None
         self.on_lost = None
+        self.mihomo = mihomo
 
     def worker(self, group_id):
         if group_id not in self.workers:

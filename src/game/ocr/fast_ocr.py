@@ -23,7 +23,7 @@ COLOR_MARGIN = 30
 MAX_DISTANCE = 130
 MIN_MARGIN = 12
 
-_MODEL_RESOURCE = files("aola_accounts").joinpath("data", "fast_templates.npz")
+#_MODEL_RESOURCE = files("aola_accounts").joinpath("data", "fast_templates.npz")
 
 
 @dataclass(frozen=True)

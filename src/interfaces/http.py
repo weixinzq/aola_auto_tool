@@ -16,11 +16,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.service.application import Application
+from src.config import PROJECT_ROOT
 from src.service.contracts import AccountInput, AccountPatch, EgressAssignment, EgressGroupInput, MessageSpec, ServiceError, TaskSpec, ScriptTaskInput
 from src.interfaces.schemas import (
     AccountImportResult, AccountRecord, TaskClearResult, ErrorResponse, HealthStatus,
     LogEntry, MessagesValidation, ScriptRecord, SessionRecord, TaskPreflight,
-    TaskRecord, TaskSummary, TaskResults, EgressGroupRecord, EgressRules, EgressAssignmentResult,
+    TaskRecord, TaskSummary, TaskResults, EgressGroupRecord, EgressRules, EgressAssignmentResult, ProxyRuntime,
 )
 
 
@@ -81,6 +82,8 @@ def create_app(
     frontend_dir: str | Path | None = None,
     max_online: int = 100,
     login_concurrency: int | None = None,
+    mihomo_config: Path | None = None,
+    mihomo_binary: Path | None = None,
 ) -> FastAPI:
     directory = Path(data_dir) if data_dir is not None else default_data_dir()
     frontend = (Path(frontend_dir) if frontend_dir is not None else
@@ -88,8 +91,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        config = mihomo_config
+        if config is None and (PROJECT_ROOT / 'mihomo' / 'nodes.yaml').exists():
+            config = PROJECT_ROOT / 'mihomo' / 'nodes.yaml'
+        if mihomo_binary is not None and config is None:
+            raise ServiceError('proxy_config', '指定 Mihomo 内核时需提供节点文件或项目 mihomo/nodes.yaml')
         app.state.application = application or Application(directory, max_online=max_online,
-                                                         login_concurrency=login_concurrency)
+                                                         login_concurrency=login_concurrency,
+                                                         mihomo_config=config, mihomo_binary=mihomo_binary)
         try:
             await app.state.application.start()
             yield
@@ -148,6 +157,10 @@ def create_app(
     @api.post("/egress-groups", status_code=201, response_model=EgressGroupRecord)
     async def create_egress_group(body: EgressGroupInput, request: Request):
         return request.app.state.application.egress.create(body)
+
+    @api.get('/egress-groups/runtime', response_model=ProxyRuntime)
+    async def proxy_runtime(request: Request):
+        return request.app.state.application.egress.runtime()
 
     @api.get("/egress-groups/rules", response_model=EgressRules)
     async def egress_rules(request: Request):

@@ -318,7 +318,9 @@ async def http_login(
     diagnostic_dir: Optional[str] = None,
 ) -> LoginResult:
     """Query the configured role. Legacy browser_verification is ignored."""
-    conf = {} if network_mode == "system" else load_user_config()
+    conf = {} if network_mode in {"system", "proxy"} else load_user_config()
+    if network_mode == "proxy" and not proxy_url:
+        raise ValueError('独立代理模式必须指定代理地址')
     request_timeout = aiohttp.ClientTimeout(
         total=float(timeout if timeout is not None else conf.get("timeout", 30))
     )
@@ -344,9 +346,10 @@ async def http_login(
     response_body = b""
     try:
         from src.network.proxy import process_proxy, proxy_connector
-        effective_proxy = None if network_mode == "system" else (proxy_url or process_proxy())
+        effective_proxy = (None if network_mode == "system" else proxy_url if network_mode == "proxy"
+                           else (proxy_url or process_proxy()))
         session_options = {"connector": proxy_connector(effective_proxy)} if effective_proxy else {}
-        if network_mode == "system":
+        if network_mode in {"system", "proxy"}:
             session_options["trust_env"] = False
         async with aiohttp.ClientSession(**session_options) as session:
             async def post(url, params, name):

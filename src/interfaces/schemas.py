@@ -68,6 +68,13 @@ class EgressGroupRecord(BaseModel):
     exit_checked_at: str | None
 
 
+class ProxyRuntime(BaseModel):
+    mode: Literal['managed', 'external']
+    state: str
+    nodes: list[str]
+    pid: int | None
+
+
 class EgressRules(BaseModel):
     yaml: str
     instructions: str

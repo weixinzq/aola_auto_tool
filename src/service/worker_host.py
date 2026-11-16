@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 from pydantic import TypeAdapter
@@ -19,11 +20,14 @@ from src.service.runtime import Redactor
 from src.service.worker_process import actual_executable, bind_linux_parent
 from src.service.worker_transport import open_worker_connection
 from src.network.server_probe import probe_server, transport_result
+from src.network.proxy import process_proxy, proxy_connector
 
 
 async def detect_exit_ip():
     # Independent services avoid treating a blocked IP-check endpoint as a broken exit.
-    async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=12)) as client:
+    proxy_url = process_proxy()
+    options = {'connector': proxy_connector(proxy_url)} if proxy_url else {}
+    async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=12), **options) as client:
         for url, json_response in (("https://api.ipify.org?format=json", True),
                                    ("https://checkip.amazonaws.com", False)):
             try:
@@ -33,7 +37,13 @@ async def detect_exit_ip():
                     return str(ipaddress.IPv4Address(value))
             except (aiohttp.ClientError, TimeoutError, ValueError, KeyError):
                 continue
-    raise ServiceError("egress_probe_failed", "出口检测失败，请检查 Clash 规则、节点连接和公网 IP 服务可用性")
+    raise ServiceError("egress_probe_failed", "出口检测失败，请检查代理节点和公网 IP 服务可用性")
+
+
+def connection_config(config):
+    proxy_url = process_proxy()
+    return dict(config, network_mode='proxy' if proxy_url else 'system', proxy_url=proxy_url,
+                browser_verification=False)
 
 
 class WorkerHost:
@@ -44,6 +54,9 @@ class WorkerHost:
         self.commands = {}
         self.registry = ScriptRegistry(MessageService(), lazy=True)
         self.redactor = Redactor(None)
+        self.redactor.add(process_proxy())
+        if process_proxy():
+            self.redactor.add(urlsplit(process_proxy()).password)
         self.account_scope = ContextVar("worker_account", default=None)
         self.control_writer = None
 
@@ -78,7 +91,7 @@ class WorkerHost:
             if account_id in self.connections or account_id in self.probing:
                 raise ServiceError("worker_account_busy", "账号已经存在于执行进程", 409)
             self.probing.add(account_id)
-            config = dict(data["config"], network_mode="system", browser_verification=False)
+            config = connection_config(data["config"])
             self.redactor.collect(config)
             try:
                 if data.get("start_at"):
@@ -100,7 +113,7 @@ class WorkerHost:
         if operation == "connect":
             if account_id in self.connections or account_id in self.probing:
                 raise ServiceError("worker_account_busy", "账号已经存在于执行进程", 409)
-            config = data["config"]
+            config = connection_config(data["config"])
             self.redactor.collect(config)
             connection = self.factory(AccountSpec(data["label"], config))
             self.connections[account_id] = connection

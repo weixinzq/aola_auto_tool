@@ -74,8 +74,11 @@ class GameSocket:
     """
     def __init__(self, session_id: str = "", proxy_url: str | None = None, *, network_mode: str = "legacy"):
         from src.network.proxy import process_proxy
-        self.proxy_url = None if network_mode == "system" else (proxy_url or process_proxy())
-        self._system_network = network_mode == "system"
+        if network_mode == "proxy" and not proxy_url:
+            raise ValueError('独立代理模式必须指定代理地址')
+        self.proxy_url = (None if network_mode == "system" else proxy_url if network_mode == "proxy"
+                          else (proxy_url or process_proxy()))
+        self._system_network = network_mode in {"system", "proxy"}
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._ws: Any = None  # websockets connection
@@ -773,6 +776,8 @@ async def login_and_connect(
     """TCP/WSS login; a retry window selects TCP only and retries before sending login."""
     if network_mode == "system":
         sock = GameSocket(session_id, network_mode="system")
+    elif network_mode == "proxy":
+        sock = GameSocket(session_id, proxy_url=proxy_url, network_mode="proxy")
     else:
         sock = GameSocket(session_id, proxy_url=proxy_url) if proxy_url else GameSocket(session_id)
     retained = False

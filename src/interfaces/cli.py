@@ -99,13 +99,18 @@ def serve(
     login_concurrency: int | None = typer.Option(None, "--login-concurrency", min=1,
                                                envvar="AOLA_LOGIN_CONCURRENCY",
                                                help="Global login and initialization limit; defaults to 20."),
+    mihomo_config: Path | None = typer.Option(None, '--mihomo-config', exists=True, dir_okay=False,
+                                             help='Node YAML; defaults to project mihomo/nodes.yaml when present.'),
+    mihomo_binary: Path | None = typer.Option(None, '--mihomo-binary', exists=True, dir_okay=False,
+                                             help='Mihomo executable; defaults to mihomo[.exe] beside the node YAML.'),
 ):
     """Run a single-worker backend; use HTTPS reverse proxying for remote access."""
     import uvicorn
     from src.interfaces.http import create_app
 
     uvicorn.run(create_app(data_dir,
-                          frontend_dir=frontend_dir, max_online=max_online, login_concurrency=login_concurrency),
+                          frontend_dir=frontend_dir, max_online=max_online, login_concurrency=login_concurrency,
+                          mihomo_config=mihomo_config, mihomo_binary=mihomo_binary),
                 host=host, port=port, workers=1, timeout_graceful_shutdown=10)
 
 
@@ -420,6 +425,12 @@ def egress_delete(ctx: typer.Context, group_id: str):
 @egress_app.command("rules")
 def egress_rules(ctx: typer.Context):
     _call(ctx, "GET", "/egress-groups/rules")
+
+
+@egress_app.command('runtime')
+def egress_runtime(ctx: typer.Context):
+    """Show the managed proxy process and available node names."""
+    _call(ctx, 'GET', '/egress-groups/runtime')
 
 
 @egress_app.command("probe")
