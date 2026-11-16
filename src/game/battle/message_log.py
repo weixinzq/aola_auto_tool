@@ -1,5 +1,6 @@
 """Temporary account-local packet evidence, retained until disconnect."""
 import json
+import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -22,8 +23,9 @@ def _related_send(ext_id, cmd):
 
 
 class BattleMessageLog:
-    def __init__(self, context):
+    def __init__(self, context, *, quiet=False):
         self.context = context
+        self.quiet = quiet
         self._log = context.log
         self.closed = False
         self.script = ''
@@ -59,13 +61,19 @@ class BattleMessageLog:
             'event': event, 'battle_epoch': battle.battle_epoch,
             'battle_id': battle.battle_id, 'phase': battle.phase,
             'match_pending': battle.match_pending, **fields,
+            'turn': battle.current_turn,
+            'auto_enabled': self.context.auto_battle.enabled,
+            'extra_action_delay_s': self.context.auto_battle.extra_action_delay_seconds,
         }
         try:
             self._stream.write(json.dumps(record, ensure_ascii=False,
                                           separators=(',', ':'), default=_json_default) + '\n')
         except (OSError, TypeError, ValueError) as error:
             self._detach()
-            self._log(f'[收发日志] 保存失败，已停止记录：{self.path}；{error}')
+            if self.quiet:
+                logging.getLogger(__name__).warning('收发日志保存失败：%s；%s', self.path, error)
+            else:
+                self._log(f'[收发日志] 保存失败，已停止记录：{self.path}；{error}')
 
     def received(self, message, *, filtered=False):
         # Keep unknown notifications too: the opponent-disconnect command is unknown.

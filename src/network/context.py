@@ -359,7 +359,7 @@ class AppContext:
         from src.game.battle.diagnostics import capture
         return capture(self, callback)
 
-    def enable_battle_message_log(self, script_name):
+    def enable_battle_message_log(self, script_name, *, quiet=False):
         from src.game.battle.control import current_round
         from src.game.battle.message_log import BattleMessageLog
         scope = current_round(self)
@@ -368,16 +368,18 @@ class AppContext:
         created = recorder is None
         if created:
             try:
-                recorder = self.battle_message_log = BattleMessageLog(self)
+                recorder = self.battle_message_log = BattleMessageLog(self, quiet=quiet)
             except OSError as error:
-                self.log(f'[收发日志] 无法创建日志文件：{error}')
+                if not quiet:
+                    self.log(f'[收发日志] 无法创建日志文件：{error}')
                 return None
         if recorder.closed:
             return None
+        recorder.quiet = quiet
         recorder.start_round(script_name, number)
         if recorder.closed:
             return None
-        if created or number == 1:
+        if not quiet and (created or number == 1):
             self.log(f'[收发日志] 文件：{recorder.path}；持续记录到账号断开')
         return recorder.path
 

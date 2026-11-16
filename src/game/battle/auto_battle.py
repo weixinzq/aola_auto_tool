@@ -99,7 +99,14 @@ class AutoBattle:
                 if not isinstance(player, dict):
                     continue
                 view = player.get("battleView")
-                if isinstance(view, dict) and isinstance(view.get("pmmId"), int):
+                if isinstance(view, dict):
+                    owner_id = view.get("pmmId")
+                    if isinstance(owner_id, float) and owner_id.is_integer():
+                        # AMF Number IDs can be integral doubles; preserve the raw message.
+                        view = {**view, "pmmId": int(owner_id)}
+                        player = {**player, "battleView": view}
+                    if isinstance(view.get("pmmId"), bool) or not isinstance(view.get("pmmId"), int):
+                        continue
                     slot = view.get("slotId")
                     if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
                         continue

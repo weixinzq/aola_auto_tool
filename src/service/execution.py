@@ -78,8 +78,8 @@ class ScriptContext:
     def battle_diagnostics(self, callback):
         return self._context.battle_diagnostics(callback)
 
-    def enable_battle_message_log(self, script_name):
-        return self._context.enable_battle_message_log(script_name)
+    def enable_battle_message_log(self, script_name, *, quiet=False):
+        return self._context.enable_battle_message_log(script_name, quiet=quiet)
 
     def assert_automation_allowed(self):
         self._context.assert_automation_allowed()

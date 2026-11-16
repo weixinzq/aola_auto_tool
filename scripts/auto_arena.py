@@ -14,7 +14,7 @@ from src.game.battle import control as battle_control
 from src.network.context import AppContext
 from src.scripting.composer import MessageBatchStep, ScriptStep, execute_steps
 from src.scripting.loader import InteractionScript, ScriptExecutionError
-from aola_accounts import recognize_bytes
+from src.game.ocr.ocr import recognize_bytes
 SCRIPT_NAME = "自动竞技场"
 SCRIPT_DESCRIPTION = '参数: mt , mode'
 BEIJING = timezone(timedelta(hours=8))
@@ -35,6 +35,7 @@ async def run(context: AppContext) -> tuple[SendResult, ...]:
         raise ValueError('mt 必须为数字 0 或 1')
     if mode not in ('battle', 'escape'):
         raise ValueError('mode 必须为文本 battle 或 escape')
+    context.enable_battle_message_log('auto_arena', quiet=True)
     log = context.log
     # 只静音本次脚本传给通用执行器的中间日志，不修改原账号上下文。
     context = copy(context)
