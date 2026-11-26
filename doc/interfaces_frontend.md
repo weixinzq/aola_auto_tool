@@ -24,6 +24,7 @@
 | `src/app.py` | 传统交互式控制台菜单编排（保留的控制台入口能力）。 |
 | `src/ui/runtime_log.py` | 后端与 CLI 共用的持久化运行诊断日志（`configure_runtime_logging`、`LoggerStream`）。 |
 | `frontend/src/` | Vue 3 + TypeScript + Vite 前端项目，构建产物输出至 `frontend/dist`，由 FastAPI 直接托管。 |
+| `tests/test_api_cli.py` | 通过 FastAPI 测试客户端和本机回环 CLI 验证公开接口，使用临时 SQLite、模拟会话和模拟出口。 |
 
 ---
 
@@ -63,3 +64,5 @@
 - 任务详情 SSE 将已提交的日志批次合并为一次传输，每条日志仍有独立的 `data:` 帧和 `event: "log"` 字段。客户端可继续使用原有事件解析与 `after` 分页游标。
 - 会话连接、重连和断开请求的 `concurrency` 上限为 500，实际同时连接数仍受运行时登录名额与出口容量限制。
 - **前后端契约同步**：修改 `src/interfaces/schemas.py` 或 `src/service/contracts.py` 后，需同步检查并更新 `frontend/src/api.generated.ts` 及对应组件。
+- 在项目根目录运行 `python -m unittest tests.test_api_cli -v`。测试覆盖携带 `Origin` 的写请求、账号脱敏、池化会话与出口排队、任务列表与详情、日志分页、SSE 断开后的任务状态及 CLI 错误响应。
+- 与并发改造前的提交 `b84201c` 对照，26 个 OpenAPI 路径及其请求和响应定义一致。唯一的规范差异是 `SessionInput.concurrency` 上限由 100 调整到 500。

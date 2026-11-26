@@ -94,3 +94,4 @@
 | :--- | :--- | :--- |
 | 2026-11-26 | 建立初始架构文档体系（`doc/main.md` 及 6 份模块子文档），完成全仓库模块盘点与高并发瓶颈基线记录。 | 全部子文档 |
 | 2026-11-26 | 完成 300 会话并发改造，加入 SQLite 批量写入和留存、按来源脱敏、任务快照异步持久化、Worker IPC 与 SSE 合批，并调整会话操作并发上限。 | [服务编排](./service_orchestration.md)、[存储](./storage_persistence.md)、[Worker 与出口](./workers_egress.md)、[HTTP 与前端](./interfaces_frontend.md) |
+| 2026-11-26 | 将旧 API 测试迁移到当前 HTTP 和 CLI 契约。14 项 API 用例及另外 58 项并发、存储和 Worker 回归通过。 | [HTTP 与前端](./interfaces_frontend.md) |

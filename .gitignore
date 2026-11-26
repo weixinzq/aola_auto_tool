@@ -21,6 +21,7 @@
 !/doc/
 !/tests/test_300_concurrency.py
 !/tests/benchmark_300_concurrency.py
+!/tests/test_api_cli.py
 /frontend/src/**/*.test.ts
 
 # Local dependencies, generated output, and private task data.
