@@ -40,7 +40,7 @@
 | **报文与脚本** | `/messages/parse`, `/messages/validate`, `/scripts` | POST/GET | `#send` 报文解析预检、可用脚本清单 |
 | **任务与探测** | `/tasks`, `/tasks/validate`, `/tasks/{id}`, `/tasks/{id}/cancel`, `/tasks/{id}/results`, `/tasks/{id}/logs` | GET/POST/DELETE | 任务预检、提交（202）、查询、取消、结果与日志拉取 |
 | **服务器探测** | `/server-probes/validate`, `/server-probes` | POST | 服务器可用性与错峰登录探测 |
-| **实时事件** | `/events` | GET (SSE) | 订阅 `task`/`session`/`egress`/`log` 实时推送，15s 心跳保活 |
+| **实时事件** | `/events` | GET (SSE) | 全局流接收状态事件，`task_id` 流接收匹配任务的状态和日志，15 秒心跳保活 |
 
 ---
 
@@ -59,5 +59,7 @@
 
 - **同源校验**：非 `GET/HEAD/OPTIONS` 请求携带 `Origin` 头时必须与服务同源（`_same_origin`），否则返回 `403 origin_mismatch`。
 - **敏感字段保护**：`RequestValidationError` 处理器故意裁剪了提交值（避免密码随 422 错误回显）。
-- **并发与性能**：当前路由多为 `async def` 但内部直接调用同步 `Store`；同时 SSE 推送循环中使用了 `jsonable_encoder`，高并发日志下需重点优化（参见 [main.md](./main.md)）。
+- 账号和任务列表、日志分页、报文解析和规则生成的同步工作通过线程池运行。活动任务详情在事件循环上获取快照，脱敏、存储查询与 JSON 序列化交给线程池。账号状态或凭据有变化时，重新生成活动任务的响应。
+- 任务详情 SSE 将已提交的日志批次合并为一次传输，每条日志仍有独立的 `data:` 帧和 `event: "log"` 字段。客户端可继续使用原有事件解析与 `after` 分页游标。
+- 会话连接、重连和断开请求的 `concurrency` 上限为 500，实际同时连接数仍受运行时登录名额与出口容量限制。
 - **前后端契约同步**：修改 `src/interfaces/schemas.py` 或 `src/service/contracts.py` 后，需同步检查并更新 `frontend/src/api.generated.ts` 及对应组件。

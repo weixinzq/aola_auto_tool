@@ -1,4 +1,5 @@
 """Explicitly enabled, verified exits shared by all account connections."""
+import asyncio
 from ipaddress import ip_address
 from uuid import uuid4
 import yaml
@@ -12,9 +13,16 @@ class EgressService:
         self.store, self.sessions, self.workers, self.events = store, sessions, workers, events
         self._changing = set()
         self._verified = set()
+        self._creating = set()
 
     def get(self, group_id):
-        group = self.store.get_egress_group(group_id)
+        return self._profile(self.store.get_egress_group(group_id))
+
+    async def get_async(self, group_id):
+        return self._profile(await asyncio.to_thread(self.store.get_egress_group, group_id))
+
+    def _profile(self, group):
+        group_id = group["group_id"]
         if self.workers.mihomo:
             group['routing_confirmed'] = group['clash_policy'] == 'DIRECT' or (
                 self.workers.mihomo.state == 'ready' and group['clash_policy'] in self.workers.mihomo.nodes)
@@ -26,7 +34,11 @@ class EgressService:
                 "waiting_count": self.sessions.waiting_count}
 
     def list(self):
-        return [self.get(group["group_id"]) for group in self.store.list_egress_groups()]
+        return [self._profile(group) for group in self.store.list_egress_groups()]
+
+    async def list_async(self):
+        groups = await asyncio.to_thread(self.store.list_egress_groups)
+        return [self._profile(group) for group in groups]
 
     def available(self):
         return [group for group in self.list() if group["active"] and group.get("exit_ip")]
@@ -53,22 +65,37 @@ class EgressService:
             if session.slot and session.egress_group_id != group_id and session.exit_ip == ip:
                 raise ServiceError("egress_duplicate_ip", "该公网 IP 仍有其他出口的连接", 409)
 
-    def create(self, value):
+    def _new_group(self, value):
         value = value if isinstance(value, EgressGroupInput) else EgressGroupInput.model_validate(value)
         if self.workers.mihomo:
             self.workers.mihomo.validate_policy(value.clash_policy)
             value = value.model_copy(update={'routing_confirmed': True})
         if value.enabled:
             raise ServiceError("egress_unconfirmed", "新出口须先检测并确认后启用", 409)
-        if any(group["name"] == value.name for group in self.list()):
+        if value.name in self._creating or any(group["name"] == value.name for group in self.list()):
             raise ServiceError("egress_duplicate", "出口名称已存在", 409)
-        group_id = uuid4().hex
+        return value
+
+    def create(self, value):
+        value, group_id = self._new_group(value), uuid4().hex
         prepare_worker_executable(self.store.directory, group_id)
+        return self._save_group(group_id, value)
+
+    async def create_async(self, value):
+        value, group_id = self._new_group(value), uuid4().hex
+        self._creating.add(value.name)
+        try:
+            await asyncio.to_thread(prepare_worker_executable, self.store.directory, group_id)
+            return self._save_group(group_id, value)
+        finally:
+            self._creating.discard(value.name)
+
+    def _save_group(self, group_id, value):
         self.store.save_egress_group(group_id, value.model_dump())
         self.events.publish("egress", {"group_id": group_id})
         return self.get(group_id)
 
-    def import_nodes(self):
+    async def import_nodes(self):
         groups = self.store.list_egress_groups()
         policies = {group['clash_policy'] for group in groups}
         names = {group['name'] for group in groups}
@@ -78,7 +105,7 @@ class EgressService:
                 while name in names:
                     name = f'{node[:70]} ({suffix})'
                     suffix += 1
-                self.create({'name': name, 'clash_policy': node})
+                await self.create_async({'name': name, 'clash_policy': node})
                 names.add(name)
 
     def runtime(self):
@@ -95,7 +122,7 @@ class EgressService:
         if self.workers.mihomo:
             self.workers.mihomo.validate_policy(value.clash_policy)
             value = value.model_copy(update={'routing_confirmed': True})
-        if any(g["name"] == value.name and g["group_id"] != group_id for g in self.list()):
+        if value.name in self._creating or any(g["name"] == value.name and g["group_id"] != group_id for g in self.list()):
             raise ServiceError("egress_duplicate", "出口名称已存在", 409)
         route_changed = original["clash_policy"] != value.clash_policy
         if route_changed:

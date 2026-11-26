@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -15,6 +17,7 @@ from src.network.server_probe import transport_result
 
 
 _TERMINAL = frozenset({"succeeded", "failed", "cancelled", "interrupted", "skipped"})
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -42,18 +45,23 @@ class _Run:
     stop_reason: str | None = None
     workers: set[asyncio.Task] = field(default_factory=set)
     publish_handle: asyncio.TimerHandle | None = None
+    flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    revision: int = 0
+    rendered: tuple | None = None
 
 
 class TaskService:
-    def __init__(self, store, sessions, scripts, messages, events, executor=None):
+    def __init__(self, store, sessions, scripts, messages, events, executor=None, *, log_writer=None):
         self.store = store
         self.sessions = sessions
         self.scripts = scripts
         self.messages = messages
         self.events = events
+        self.log_writer = log_writer
         self.executor = executor or execute_combination
         self._runs: dict[str, _Run] = {}
         self._closing = False
+        self._submission_lock = asyncio.Lock()
         self.sessions.on_log = self._log
         self.sessions.on_state = self._session_state
 
@@ -124,29 +132,52 @@ class TaskService:
                     if spec.probe_staggered else {})}
                 for index, target in enumerate(targets)]
 
-    def _flush(self, run):
+    async def _flush(self, run):
+        run.revision += 1
+        run.rendered = None
         if run.publish_handle is not None:
             run.publish_handle.cancel()
             run.publish_handle = None
-        self.store.save_task(run.record)
-        self.events.publish("task", self.store.get_task_summary(run.record["task_id"]))
+        async with run.flush_lock:
+            task_id = run.record["task_id"]
+            if self._runs.get(task_id) is not run:
+                return
+            if self.log_writer is not None:
+                summary = await self.log_writer.save_task(deepcopy(run.record))
+            else:
+                self.store.save_task(run.record)
+                summary = self.store.get_task_summary(task_id)
+            self.events.publish("task", summary)
+
+    async def _flush_debounced(self, run):
+        try:
+            await self._flush(run)
+        except Exception as exc:
+            logger.error("任务快照写入失败 (%s)", type(exc).__name__)
 
     def _publish(self, run: _Run) -> None:
-        # Coalesce account transitions so a large batch does not synchronously
-        # rewrite its entire result array for every queued/connecting event.
-        if run.record["state"] in _TERMINAL or run.record["state"] == "queued":
-            self._flush(run)
-        elif run.publish_handle is None:
-            run.publish_handle = asyncio.get_running_loop().call_later(.2, self._flush, run)
+        run.revision += 1
+        run.rendered = None
+        if run.publish_handle is None:
+            run.publish_handle = asyncio.get_running_loop().call_later(
+                .2, lambda: asyncio.create_task(self._flush_debounced(run)))
 
-    def _log(self, task_id: str, account_id: str | None, message: str) -> None:
+    def _log(self, task_id: str, account_id: str | None, message: str, *, redacted=False, timestamp=None) -> None:
+        writer = getattr(self, "log_writer", None)
+        if writer is not None:
+            writer.enqueue(task_id, account_id, message, redacted=redacted, timestamp=timestamp)
+            return
         run = self._runs.get(task_id)
-        if run is not None:
+        if run is not None and not redacted:
             message = run.redactor.clean(message, redact_global=False)
         row = self.store.append_log(task_id, account_id, message)
         self.events.publish("log", row)
 
     async def submit(self, spec) -> dict:
+        async with self._submission_lock:
+            return await self._submit(spec)
+
+    async def _submit(self, spec) -> dict:
         if self._closing:
             raise ServiceError("service_stopping", "服务正在关闭", 503)
         spec, accounts, steps = self._prepare(spec)
@@ -173,15 +204,16 @@ class TaskService:
                    Redactor(self.store, accounts, spec.model_dump(mode="json")))
         self._runs[task_id] = run
         try:
-            self._publish(run)
+            await self._flush(run)
             for row in skipped.values():
                 self._log(task_id, row["account_id"], f"账号“{row['label']}”：{row['reason']}")
+            submitted = await self.get_async(task_id) if self.log_writer is not None else self.get(task_id)
         except BaseException:
             self._runs.pop(task_id, None)
             self.sessions.release(task_id)
             raise
         run.task = asyncio.create_task(self._run(run), name=f"service-task-{task_id}")
-        return self.get(task_id)
+        return submitted
 
     def list(self) -> list[dict]:
         return self.store.list_task_summaries()
@@ -195,29 +227,67 @@ class TaskService:
         return {"deleted_count": len(task_ids), "task_ids": task_ids}
 
     def get(self, task_id: str) -> dict:
+        return self._get_record(task_id, self._snapshot(task_id))
+
+    def _snapshot(self, task_id):
         run = self._runs.get(task_id)
-        if run is not None:
-            self._flush(run)
-        return self.store.get_task(task_id)
+        return deepcopy(run.record) if run is not None else None
+
+    def _get_record(self, task_id, snapshot, render=None):
+        if snapshot is None:
+            record = self.store.get_task(task_id)
+        else:
+            if self.log_writer is not None and any(
+                    row.get("_step_results_streamed") for row in snapshot["account_results"]):
+                self.log_writer.flush()
+            details = getattr(self.store, "get_task_details", self.store.redact)
+            record = details(snapshot)
+        return record if render is None else render(record)
+
+    async def get_async(self, task_id, *, render=None):
+        run = self._runs.get(task_id)
+        key = None
+        if render is not None and run is not None and not any(
+                row.get("_step_results_streamed") for row in run.record["account_results"]):
+            key = (run.revision, self.store.secret_revision, render)
+            if run.rendered is not None and run.rendered[0] == key:
+                return run.rendered[1]
+        record = await asyncio.to_thread(self._get_record, task_id, self._snapshot(task_id), render)
+        if key is not None and key == (run.revision, self.store.secret_revision, render):
+            run.rendered = (key, record)
+        return record
 
     def results(self, task_id: str) -> dict:
-        task = self.get(task_id)
-        result = {"task_id": task_id, "state": task["state"], "error": task.get("error"),
+        return self._results(self.get(task_id))
+
+    async def results_async(self, task_id: str) -> dict:
+        return self._results(await self.get_async(task_id))
+
+    @staticmethod
+    def _results(task: dict) -> dict:
+        result = {"task_id": task["task_id"], "state": task["state"], "error": task.get("error"),
                   "account_results": task["account_results"]}
         if task.get("kind") == "server_probe":
             result["server_results"] = task.get("server_results", [])
         return result
 
     def logs(self, task_id: str, after=0, limit=200):
-        self.get(task_id)
+        if self.log_writer is not None:
+            self.log_writer.flush()
+            self.store.get_task_summary(task_id)
+        else:
+            self.get(task_id)
         return self.store.get_logs(task_id, after=after, limit=limit)
 
     async def cancel(self, task_id: str) -> dict:
-        record = self.get(task_id)
+        record = await self.get_async(task_id) if self.log_writer is not None else self.get(task_id)
         if record["state"] in _TERMINAL:
             return record
         run = self._runs.get(task_id)
         if run is None:
+            record = self.get(task_id)
+            if record["state"] in _TERMINAL:
+                return record
             raise ServiceError("task_unavailable", "任务不属于当前运行进程", 409)
         if run.stop_reason is None:
             if any(getattr(step, 'script_id', None) == 'double_auto_battle' for step in run.spec.steps):
@@ -232,13 +302,13 @@ class TaskService:
                 run.task.cancel()
         if run.task is not None and run.task.done():
             run.task = asyncio.create_task(self._finish(run), name=f"cleanup-task-{task_id}")
-        return self.get(task_id)
+        return await self.get_async(task_id) if self.log_writer is not None else self.get(task_id)
 
     def _error(self, run: _Run, row: dict, exc: Exception) -> None:
         code = getattr(exc, "code", "execution_failed")
         message = run.redactor.clean(exc)
         row.update(state="failed", error={"code": code, "message": message})
-        self._log(run.record["task_id"], row["account_id"], message)
+        self._log(run.record["task_id"], row["account_id"], message, redacted=True)
 
     async def _connect(self, run: _Run, account: dict, row: dict) -> None:
         if run.spec.login_once:
@@ -266,18 +336,18 @@ class TaskService:
         streamed = hasattr(self.store, "append_task_steps")
         first_error = None
 
-        def save_steps(records):
+        async def save_steps(records):
             nonlocal first_error
             for step in records:
                 if step["error"]:
                     if first_error is None and not step.get("skipped", False):
                         first_error = step["error"]
                     step["error"] = run.redactor.clean(step["error"])
-            self.store.append_task_steps(run.record["task_id"], account_id, records)
-
-        async def save_local_steps(records):
-            save_steps(records)
-            await asyncio.sleep(0)
+            if self.log_writer is not None:
+                await self.log_writer.enqueue_steps(run.record["task_id"], account_id, records)
+            else:
+                self.store.append_task_steps(run.record["task_id"], account_id, records)
+                await asyncio.sleep(0)
 
         if streamed:
             # Pending batches stay private until execution returns its final audit.
@@ -289,7 +359,7 @@ class TaskService:
                              **({"on_steps": save_steps} if streamed else {}), **options)
             else:
                 await run_execution(account_id, context, run.steps, outcome, executor=self.executor,
-                                    on_steps=save_local_steps if streamed else None, **options)
+                                    on_steps=save_steps if streamed else None, **options)
         except BaseException:
             row.pop("_step_results_streamed", None)
             raise
@@ -460,6 +530,7 @@ class TaskService:
         except Exception as exc:
             run.record["error"] = {"code": getattr(exc, "code", "execution_failed"),
                                     "message": run.redactor.clean(exc)}
+            self._publish(run)
         finally:
             run.finalizing = True
             for worker in run.workers:
@@ -497,7 +568,7 @@ class TaskService:
             state = "succeeded" if all(row["state"] in {"succeeded", "skipped"}
                                        for row in run.record["account_results"]) else "failed"
         run.record.update(state=state, finished_at=_now())
-        self._publish(run)
+        await self._flush(run)
         # Do not retain submitted message parameters or credential snapshots after completion.
         run.accounts.clear()
         run.steps = ()
@@ -505,8 +576,11 @@ class TaskService:
 
     async def close(self) -> None:
         self._closing = True
-        runs = list(self._runs.values())
+        async with self._submission_lock:
+            runs = list(self._runs.values())
         for run in runs:
+            if run.record["state"] in _TERMINAL:
+                continue
             was_stopping = run.stop_reason is not None
             run.stop_reason = "interrupted"
             run.record["state"] = "cancelling"
@@ -516,3 +590,5 @@ class TaskService:
             elif run.started and not run.finalizing and not was_stopping and run.task is not None:
                 run.task.cancel()
         await asyncio.gather(*(run.task for run in runs if run.task is not None), return_exceptions=True)
+        for run in list(self._runs.values()):
+            await self._flush(run)

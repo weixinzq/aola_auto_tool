@@ -10,9 +10,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.encoders import jsonable_encoder
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.service.application import Application
@@ -46,7 +46,7 @@ class ValidateMessagesInput(InputModel):
 
 class SessionInput(InputModel):
     account_ids: list[str] = Field(min_length=1)
-    concurrency: int = Field(default=1, ge=1, le=100, strict=True)
+    concurrency: int = Field(default=1, ge=1, le=500, strict=True)
 
     @field_validator("account_ids")
     @classmethod
@@ -74,6 +74,10 @@ def _same_origin(request: Request) -> bool:
             request.url.scheme, request.url.hostname, request.url.port or defaults.get(request.url.scheme))
     except ValueError:
         return False
+
+
+def _task_json(record):
+    return TaskRecord.model_validate(record).model_dump_json(by_alias=True)
 
 
 def create_app(
@@ -133,18 +137,21 @@ def create_app(
         return {"status": "ok"}
 
     api = APIRouter(prefix=API_PREFIX, dependencies=[Depends(check_origin)])
+    account_write_lock = asyncio.Lock()
 
     @api.get("/accounts", response_model=list[AccountRecord])
-    async def accounts(request: Request):
+    def accounts(request: Request):
         return request.app.state.application.accounts.list()
 
     @api.post("/accounts", status_code=201, response_model=AccountRecord)
     async def create_account(body: AccountInput, request: Request):
-        return request.app.state.application.accounts.create(body)
+        async with account_write_lock:
+            return await run_in_threadpool(request.app.state.application.accounts.create, body)
 
     @api.post("/accounts/import", response_model=AccountImportResult)
     async def import_accounts(body: ConfigInput, request: Request):
-        return request.app.state.application.accounts.import_config(body.config)
+        async with account_write_lock:
+            return await run_in_threadpool(request.app.state.application.accounts.import_config, body.config)
 
     @api.post("/accounts/assign-egress", response_model=EgressAssignmentResult)
     async def assign_egress(body: EgressAssignment, request: Request):
@@ -152,23 +159,23 @@ def create_app(
 
     @api.get("/egress-groups", response_model=list[EgressGroupRecord])
     async def egress_groups(request: Request):
-        return request.app.state.application.egress.list()
+        return await request.app.state.application.egress.list_async()
 
     @api.post("/egress-groups", status_code=201, response_model=EgressGroupRecord)
     async def create_egress_group(body: EgressGroupInput, request: Request):
-        return request.app.state.application.egress.create(body)
+        return await request.app.state.application.egress.create_async(body)
 
     @api.get('/egress-groups/runtime', response_model=ProxyRuntime)
     async def proxy_runtime(request: Request):
         return request.app.state.application.egress.runtime()
 
     @api.get("/egress-groups/rules", response_model=EgressRules)
-    async def egress_rules(request: Request):
+    def egress_rules(request: Request):
         return request.app.state.application.egress.rules()
 
     @api.get("/egress-groups/{group_id}", response_model=EgressGroupRecord)
     async def egress_group(group_id: str, request: Request):
-        return request.app.state.application.egress.get(group_id)
+        return await request.app.state.application.egress.get_async(group_id)
 
     @api.put("/egress-groups/{group_id}", response_model=EgressGroupRecord)
     async def update_egress_group(group_id: str, body: EgressGroupInput, request: Request):
@@ -183,16 +190,18 @@ def create_app(
         return await request.app.state.application.egress.probe(group_id)
 
     @api.get("/accounts/{account_id}", response_model=AccountRecord)
-    async def account(account_id: str, request: Request):
+    def account(account_id: str, request: Request):
         return request.app.state.application.accounts.get(account_id)
 
     @api.patch("/accounts/{account_id}", response_model=AccountRecord)
     async def update_account(account_id: str, body: AccountPatch, request: Request):
-        return request.app.state.application.accounts.update(account_id, body)
+        async with account_write_lock:
+            return request.app.state.application.accounts.update(account_id, body)
 
     @api.delete("/accounts/{account_id}", status_code=204)
     async def delete_account(account_id: str, request: Request):
-        request.app.state.application.accounts.delete(account_id)
+        async with account_write_lock:
+            request.app.state.application.accounts.delete(account_id)
 
     @api.get("/sessions", response_model=list[SessionRecord])
     async def sessions(request: Request):
@@ -215,15 +224,15 @@ def create_app(
         return await session_operation("disconnect", body, request)
 
     @api.post("/messages/parse", response_model=MessagesValidation)
-    async def parse_messages(body: ParseInput, request: Request):
+    def parse_messages(body: ParseInput, request: Request):
         return request.app.state.application.messages.parse(body.text)
 
     @api.post("/messages/validate", response_model=MessagesValidation)
-    async def validate_messages(body: ValidateMessagesInput, request: Request):
+    def validate_messages(body: ValidateMessagesInput, request: Request):
         return request.app.state.application.messages.validate(body.messages)
 
     @api.get("/scripts", response_model=list[ScriptRecord])
-    async def scripts(request: Request):
+    def scripts(request: Request):
         return request.app.state.application.scripts.list()
 
     @api.post("/tasks/validate", response_model=TaskPreflight)
@@ -247,7 +256,7 @@ def create_app(
         return await request.app.state.application.tasks.submit(body)
 
     @api.get("/tasks", response_model=list[TaskSummary])
-    async def tasks(request: Request):
+    def tasks(request: Request):
         return request.app.state.application.tasks.list()
 
     @api.delete("/tasks", response_model=TaskClearResult)
@@ -256,7 +265,8 @@ def create_app(
 
     @api.get("/tasks/{task_id}", response_model=TaskRecord)
     async def task(task_id: str, request: Request):
-        return request.app.state.application.tasks.get(task_id)
+        content = await request.app.state.application.tasks.get_async(task_id, render=_task_json)
+        return Response(content, media_type="application/json")
 
     @api.post("/tasks/{task_id}/cancel", response_model=TaskRecord)
     async def cancel(task_id: str, request: Request):
@@ -264,11 +274,11 @@ def create_app(
 
     @api.get("/tasks/{task_id}/results", response_model=TaskResults)
     async def results(task_id: str, request: Request):
-        return request.app.state.application.tasks.results(task_id)
+        return await request.app.state.application.tasks.results_async(task_id)
 
     @api.get("/tasks/{task_id}/logs", response_model=list[LogEntry])
-    async def logs(task_id: str, request: Request,
-                   after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000)):
+    def logs(task_id: str, request: Request,
+             after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000)):
         return request.app.state.application.tasks.logs(task_id, after=after, limit=limit)
 
     @api.get("/events", response_class=StreamingResponse,
@@ -277,7 +287,7 @@ def create_app(
         hub = request.app.state.application.events
 
         async def stream():
-            queue = hub.subscribe()
+            queue = hub.subscribe(include_logs=bool(task_id), task_id=task_id, batch_logs=True)
             try:
                 yield ": connected\n\n"
                 while True:
@@ -288,13 +298,9 @@ def create_app(
                     except asyncio.TimeoutError:
                         yield ": keepalive\n\n"
                         continue
-                    if event["event"] == "log" and not task_id:
-                        continue
-                    payload = jsonable_encoder(event)
-                    event_task_id = payload.get("task_id") or payload.get("data", {}).get("task_id")
-                    if task_id and event_task_id != task_id:
-                        continue
-                    yield "data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+                    batch = event if isinstance(event, list) else [event]
+                    yield "".join("data: " + json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+                                  for item in batch)
             finally:
                 hub.unsubscribe(queue)
 

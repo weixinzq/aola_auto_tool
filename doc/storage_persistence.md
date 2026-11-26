@@ -1,7 +1,7 @@
 # 数据持久化与迁移 (`storage_persistence.md`)
 
 > **隶属主文档**：[main.md](./main.md)  
-> **覆盖路径**：`src/service/store.py`, `src/service/migrations/`
+> **覆盖路径**：`src/service/store.py`、`src/service/log_writer.py`、`src/service/migrations/`
 
 ---
 
@@ -16,7 +16,7 @@
 - **数据库路径**：`<data_dir>/service.sqlite3`（默认 `data/service/service.sqlite3`），非 Windows 平台目录权限 `0o700`、库文件权限 `0o600`。
 - **连接配置（`Store.__init__`）**：
   - `check_same_thread=False`
-  - 连接钩子自动设置 `PRAGMA journal_mode=WAL` 与 `PRAGMA busy_timeout=5000`
+  - 连接钩子设置 `journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=5000`、`temp_store=MEMORY` 和 `cache_size=-32000`。
 - **Alembic 迁移脚本（`src/service/migrations/versions/`）**：
   1. `0001_initial.py`：初始化基础表结构
   2. `0002_egress_groups.py`：引入出口分组配置表
@@ -39,16 +39,18 @@
 
 ## 4. 凭据脱敏与查询设计
 
-- **启动加载敏感词**：`Store.__init__` 遍历所有账号的 `account` 与 `password` 及其 MD5 加入 `self._secrets`，懒编译正则 `self._secret_pattern`。
-- **脱敏落库**：`save_task()`、`append_task_steps()`、`append_log()` 落盘前均调用 `Store.redact()`，同时保留 `_GENERATED_FIELDS`（如 `task_id`、`account_id`、`state` 等系统字段）避免被单字符密码误伤。
+- `Store` 注册账号、密码及其 MD5 和 URL 编码值。父进程生成的日志在写线程脱敏，经 Worker 脱敏的日志可直接批量落库。
+- `save_task()` 和 `append_task_steps_batch()` 对结构化数据脱敏。任务记录处理保留系统生成的 ID 和状态字段。
+- `get_egress_group()` 按 `group_id` 查询，出口列表一次读取全部配置后组装运行态。
 - **任务摘要优化**：`list_task_summaries()` / `get_task_summary()` 直接通过 SQLite `json_extract` / `json_each` / `json_array_length` 在库内聚合摘要字段，避免列表页加载庞大 `step_results`。
 
 ---
 
-## 5. 维护注意点
+## 5. 批量写入与留存
 
-- **Schema 变更规范**：任何新增表或列必须通过新增 Alembic 迁移文件（`0005_*.py`）实现，禁止仅改 `store.py` 里的 `Table(...)` 定义而不写迁移。
-- **高并发性能风险**：
-  - `append_log()` 当前每次调用独立提交事务且默认 `synchronous=FULL`，高并发日志下必须改造为批量事务写入并启用 `PRAGMA synchronous=NORMAL`。
-  - `get_egress_group()` 当前实现先调用了 `list_egress_groups()` 全表扫描再过滤，应改为 `WHERE group_id = ?`。
-  - `logs` 表目前无自动裁剪/TTL，长期高频运行需注意磁盘体积膨胀与 `delete_tasks()` 清理耗时。
+- `BatchLogWriter` 使用容量 30,000 的队列和单写线程。日志与步骤满 500 项或每 200 ms 提交一批。任务快照、查询刷盘和关停指令按队列顺序处理。
+- 日志入队时队列已满会丢弃当前日志并累计 `dropped_count`，运行诊断每 5 秒汇总一次。步骤、快照和刷盘指令等待写入容量。
+- 日志批量提交后分配持久化 `id` 并触发 SSE 推送。日志分页查询先等待读取前已入队的数据提交，单次仍最多返回 1,000 条。
+- 环境变量 `AOLA_MAX_LOGS_PER_TASK` 默认 50,000，设置为 `0` 可关闭留存限制。每 50 个日志批次及关停时裁剪近期写入的任务，保留最新记录。
+
+表结构变更继续通过 Alembic 迁移管理。

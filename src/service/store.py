@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import hashlib
 import os
 from pathlib import Path
-import re
 from uuid import uuid4
 
 from alembic import command
@@ -14,6 +12,7 @@ from sqlalchemy import Column, Integer, JSON, MetaData, String, Table, create_en
 
 from src.service.contracts import ServiceError
 from src.service.events import utc_now
+from src.service.runtime import Redactor
 
 
 metadata = MetaData()
@@ -26,7 +25,7 @@ logs = Table("logs", metadata, Column("id", Integer, primary_key=True, autoincre
 task_step_batches = Table("task_step_batches", metadata, Column("id", Integer, primary_key=True),
                           Column("task_id", String, nullable=False), Column("account_id", String, nullable=False),
                           Column("records", JSON, nullable=False))
-_SECRET_KEYS = {"password", "sid", "session_id", "session-id", "token", "authorization", "secret", "loginkey"}
+_SECRET_KEYS = Redactor._secret_keys - {"account", "username"}
 _GENERATED_FIELDS = {"task_id", "account_id", "account_ids", "script_id", "created_at", "updated_at",
                      "started_at", "finished_at", "timestamp", "state", "kind", "mode", "session_policy",
                      "status", "business_confirmation", "code", "egress_group_id"}
@@ -38,15 +37,17 @@ class Store:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name != "nt":
             self.directory.chmod(0o700)
-        self._secrets = set()
-        self._secret_pattern = None
+        self._redactor = Redactor(None)
         db = self.directory / "service.sqlite3"
         self.engine = create_engine("sqlite:///" + db.as_posix(), connect_args={"check_same_thread": False})
 
         @event.listens_for(self.engine, "connect")
         def configure(connection, _):
-            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA temp_store=MEMORY")
+            connection.execute("PRAGMA cache_size=-32000")
 
         config = Config()
         config.set_main_option("script_location", str(Path(__file__).with_name("migrations")))
@@ -63,12 +64,14 @@ class Store:
         self.add_secret(account.get("account"))
 
     def add_secret(self, value):
-        if value:
-            value = str(value)
-            additions = {value, hashlib.md5(value.encode()).hexdigest()}
-            if not additions.issubset(self._secrets):
-                self._secrets.update(additions)
-                self._secret_pattern = None
+        self._redactor.add(value)
+
+    @property
+    def secret_revision(self):
+        return len(self._redactor.values)
+
+    def redact_log(self, value):
+        return self._redactor.clean(value)
 
     def redact(self, value, *, task_record=False):
         if isinstance(value, dict):
@@ -80,11 +83,7 @@ class Store:
         if isinstance(value, (list, tuple)):
             return [self.redact(item, task_record=task_record) for item in value]
         if isinstance(value, str):
-            if self._secrets:
-                if self._secret_pattern is None:
-                    self._secret_pattern = re.compile("|".join(re.escape(secret) for secret in sorted(self._secrets, key=len, reverse=True)))
-                value = self._secret_pattern.sub("<redacted>", value)
-            return re.sub(r"(?i)(sid|session[_-]id|password|token)([\"']?\s*[:=]\s*[\"']?)[^\s,\"'&}]+", r"\1\2<redacted>", value)
+            return self._redactor.clean(value, replacement="<redacted>")
         return value
 
     @staticmethod
@@ -129,10 +128,11 @@ class Store:
             return [{"group_id": row.group_id, **row.config} for row in connection.execute(select(egress_groups))]
 
     def get_egress_group(self, group_id):
-        group = next((row for row in self.list_egress_groups() if row["group_id"] == group_id), None)
-        if group is None:
+        with self.engine.connect() as connection:
+            row = connection.execute(select(egress_groups).where(egress_groups.c.group_id == group_id)).first()
+        if row is None:
             raise ServiceError("egress_not_found", "出口分组不存在", 404)
-        return group
+        return {"group_id": row.group_id, **row.config}
 
     def save_egress_group(self, group_id, config):
         with self.engine.begin() as connection:
@@ -171,9 +171,23 @@ class Store:
             return self._task_details(row[0], connection)
 
     def append_task_steps(self, task_id, account_id, records):
+        self.append_task_steps_batch([(task_id, account_id, records)])
+
+    def append_task_steps_batch(self, items, *, redacted=False):
+        if not items:
+            return
+        rows = [{"task_id": task_id, "account_id": account_id,
+                 "records": records if redacted else self.redact(records, task_record=True)}
+                for task_id, account_id, records in items]
         with self.engine.begin() as connection:
-            connection.execute(task_step_batches.insert().values(task_id=task_id, account_id=account_id,
-                records=self.redact(records, task_record=True)))
+            connection.execute(task_step_batches.insert(), rows)
+
+    def get_task_details(self, snapshot):
+        record = self.redact(snapshot, task_record=True)
+        if any(row.get("_step_results_streamed") for row in record.get("account_results", [])):
+            with self.engine.connect() as connection:
+                return self._task_details(record, connection)
+        return self._task_details(record, None)
 
     def _task_details(self, record, connection):
         targets = {}
@@ -234,10 +248,26 @@ class Store:
             connection.execute(tasks.delete().where(tasks.c.task_id.in_(task_ids)))
 
     def append_log(self, task_id, account_id, message):
-        row = {"task_id": task_id, "account_id": account_id, "timestamp": utc_now(), "message": self.redact(str(message))}
+        return self.append_logs_batch([{"task_id": task_id, "account_id": account_id, "timestamp": utc_now(),
+                                        "message": str(message)}])[0]
+
+    def append_logs_batch(self, rows, *, redacted=False):
+        if not rows:
+            return []
+        if not redacted:
+            rows = [{**row, "message": self.redact_log(row["message"])} for row in rows]
         with self.engine.begin() as connection:
-            result = connection.execute(logs.insert().values(**row))
-        return {"id": result.inserted_primary_key[0], **row}
+            connection.execute(logs.insert(), rows)
+            # A single SQLite writer owns these consecutive rowids until commit.
+            last_id = connection.scalar(select(func.last_insert_rowid()))
+        return [{"id": row_id, **row} for row_id, row in enumerate(rows, last_id - len(rows) + 1)]
+
+    def prune_logs(self, task_ids, max_logs):
+        with self.engine.begin() as connection:
+            for task_id in task_ids:
+                cutoff = select(logs.c.id).where(logs.c.task_id == task_id).order_by(
+                    logs.c.id.desc()).offset(max_logs).limit(1).scalar_subquery()
+                connection.execute(logs.delete().where(logs.c.task_id == task_id, logs.c.id <= cutoff))
 
     def get_logs(self, task_id, after=0, limit=200):
         query = select(logs).where(logs.c.task_id == task_id, logs.c.id > after).order_by(logs.c.id).limit(min(max(limit, 1), 1000))

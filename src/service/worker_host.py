@@ -1,10 +1,12 @@
 """Isolated worker with a dedicated control channel and account contexts."""
 import argparse
 import asyncio
+from collections import deque
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -16,11 +18,15 @@ from src.accounts.manager import AccountConnection, AccountSpec
 from src.service.contracts import StepSpec, ServiceError
 from src.service.execution import MessageService, ScriptRegistry
 from src.service.execution_runner import run_execution
+from src.service.events import utc_now
 from src.service.runtime import Redactor
 from src.service.worker_process import actual_executable, bind_linux_parent
-from src.service.worker_transport import open_worker_connection
+from src.service.worker_transport import MESSAGE_LIMIT, open_worker_connection
 from src.network.server_probe import probe_server, transport_result
 from src.network.proxy import process_proxy, proxy_connector
+
+
+logger = logging.getLogger(__name__)
 
 
 async def detect_exit_ip():
@@ -59,13 +65,68 @@ class WorkerHost:
             self.redactor.add(urlsplit(process_proxy()).password)
         self.account_scope = ContextVar("worker_account", default=None)
         self.control_writer = None
+        self.write_lock = asyncio.Lock()
+        self._log_lock = asyncio.Lock()
+        self._log_ready = asyncio.Event()
+        self._log_buffer = deque()
+        self._log_stopping = False
+        self._log_drops = 0
 
-    def write(self, message):
-        self.control_writer.write((json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+    async def send(self, message):
+        payload = (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(payload) > MESSAGE_LIMIT and message.get("event") == "log_batch":
+            items = message["items"]
+            if len(items) == 1:
+                self._log_drops += 1
+                return
+            middle = len(items) // 2
+            await self.send({"event": "log_batch", "items": items[:middle]})
+            await self.send({"event": "log_batch", "items": items[middle:]})
+            return
+        async with self.write_lock:
+            if self.control_writer is None or self.control_writer.is_closing():
+                return
+            self.control_writer.write(payload)
+            try:
+                await self.control_writer.drain()
+            except ConnectionError:
+                self.control_writer.close()
 
     def log(self, message, account_id=None):
-        self.write({"event": "log", "account_id": account_id or self.account_scope.get(),
-                    "message": self.redactor.clean(message)})
+        if len(self._log_buffer) >= 5000:
+            self._log_drops += 1
+            return
+        self._log_buffer.append({"account_id": account_id or self.account_scope.get(),
+                                 "message": self.redactor.clean(message), "timestamp": utc_now()})
+        if len(self._log_buffer) >= 50:
+            self._log_ready.set()
+
+    async def _flush_logs(self):
+        async with self._log_lock:
+            # Keep this drain finite even while other accounts continue logging.
+            remaining = len(self._log_buffer)
+            while remaining:
+                batch = [self._log_buffer.popleft() for _ in range(min(50, remaining))]
+                remaining -= len(batch)
+                await self.send({"event": "log_batch", "items": batch})
+
+    async def _send_logs(self):
+        next_warning = asyncio.get_running_loop().time() + 5
+        while not self._log_stopping:
+            try:
+                await asyncio.wait_for(self._log_ready.wait(), .1)
+            except TimeoutError:
+                pass
+            self._log_ready.clear()
+            await self._flush_logs()
+            if asyncio.get_running_loop().time() >= next_warning:
+                self._report_log_drops()
+                next_warning = asyncio.get_running_loop().time() + 5
+
+    def _report_log_drops(self):
+        if self._log_drops:
+            logger.warning("执行进程日志缓冲区已满或 IPC 消息过大，丢弃 %d 条日志", self._log_drops)
+            self._log_drops = 0
 
     async def operate(self, command, outcome):
         operation, account_id, data = command["op"], command.get("account_id"), command.get("data", {})
@@ -126,8 +187,8 @@ class WorkerHost:
                 context.log_callback = lambda text: self.log(text, account_id)
                 messages = getattr(context, "messages", None)
                 if hasattr(messages, "add_disconnect_observer"):
-                    messages.add_disconnect_observer(lambda reason: self.write({
-                        "event": "disconnected", "account_id": account_id, "reason": self.redactor.clean(reason)}))
+                    messages.add_disconnect_observer(lambda reason: asyncio.create_task(self.send({
+                        "event": "disconnected", "account_id": account_id, "reason": self.redactor.clean(reason)})))
             return {"connected": connected, "state": connection.state,
                     "last_error": self.redactor.clean(connection.last_error),
                     "login_block_reason": connection.login_block_reason}
@@ -155,8 +216,7 @@ class WorkerHost:
                 for step in records:
                     if step["error"]:
                         step["error"] = self.redactor.clean(step["error"])
-                self.write({"event": "steps", "request_id": command["id"], "steps": records})
-                await self.control_writer.drain()
+                await self.send({"event": "steps", "request_id": command["id"], "steps": records})
                 await asyncio.sleep(0)
 
             await run_execution(account_id, context, steps, outcome,
@@ -172,21 +232,28 @@ class WorkerHost:
         token = self.account_scope.set(command.get("account_id"))
         outcome = {"network_write": {"status": "unknown", "count": None}}
         try:
-            result = await self.operate(command, outcome)
-            self.write({"id": request_id, "ok": True, "data": result})
-        except asyncio.CancelledError:
-            self.write({"id": request_id, "ok": False, "cancelled": True, "data": outcome})
-        except Exception as error:
-            self.write({"id": request_id, "ok": False, "data": outcome,
-                        "error": {"code": getattr(error, "code", "worker_operation_failed"),
-                                  "message": self.redactor.clean(error)}})
+            try:
+                try:
+                    result = await self.operate(command, outcome)
+                    response = {"id": request_id, "ok": True, "data": result}
+                except Exception as error:
+                    response = {"id": request_id, "ok": False, "data": outcome,
+                                "error": {"code": getattr(error, "code", "worker_operation_failed"),
+                                          "message": self.redactor.clean(error)}}
+                if command["op"] in {"initialize", "execute", "disconnect", "server_probe", "shutdown"}:
+                    # Deliver the logs before the parent can release the request's account.
+                    await asyncio.shield(self._flush_logs())
+            except asyncio.CancelledError:
+                await asyncio.shield(self._flush_logs())
+                response = {"id": request_id, "ok": False, "cancelled": True, "data": outcome}
+            await asyncio.shield(self.send(response))
         finally:
             self.account_scope.reset(token)
             self.commands.pop(request_id, None)
-        await self.control_writer.drain()
 
     async def run(self, reader, writer):
         self.control_writer = writer
+        log_sender = asyncio.create_task(self._send_logs(), name="worker-log-sender")
         try:
             while line := await reader.readline():
                 command = json.loads(line)
@@ -196,9 +263,16 @@ class WorkerHost:
             for task in list(self.commands.values()):
                 task.cancel()
             await asyncio.gather(*list(self.commands.values()), return_exceptions=True)
-            await asyncio.gather(*(connection.disconnect() for connection in self.connections.values()), return_exceptions=True)
-            writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.gather(*(connection.disconnect() for connection in self.connections.values()), return_exceptions=True)
+                self._log_stopping = True
+                self._log_ready.set()
+                await log_sender
+                await self._flush_logs()
+            finally:
+                self._report_log_drops()
+                writer.close()
+                await writer.wait_closed()
 
 
 def main(connection_factory=AccountConnection, *, host_factory=None):

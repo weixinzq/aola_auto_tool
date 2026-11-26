@@ -1,10 +1,12 @@
 """Composition root shared by service hosts and offline tests."""
+import asyncio
 from pathlib import Path
 
 from src.accounts.manager import AccountConnection
 from src.service.accounts import AccountService
 from src.service.events import EventHub
 from src.service.execution import MessageService, ScriptRegistry
+from src.service.log_writer import BatchLogWriter
 from src.service.store import Store
 from src.service.runtime import SessionService
 from src.service.tasks import TaskService
@@ -20,6 +22,7 @@ class Application:
                  mihomo_config=None, mihomo_binary=None):
         self.store = Store(Path(data_dir))
         self.events = EventHub()
+        self.log_writer = BatchLogWriter(self.store, self.events)
         self.messages = MessageService()
         self.scripts = ScriptRegistry(self.messages)
         self.mihomo = Mihomo(mihomo_config, self.store.directory, mihomo_binary) if mihomo_config else None
@@ -33,7 +36,8 @@ class Application:
         if self.mihomo:
             self.mihomo.on_lost = self.proxy_lost
         self.accounts = AccountService(self.store, self.sessions, self.events, self.egress)
-        self.tasks = TaskService(self.store, self.sessions, self.scripts, self.messages, self.events, executor=executor)
+        self.tasks = TaskService(self.store, self.sessions, self.scripts, self.messages, self.events,
+                                 executor=executor, log_writer=self.log_writer)
         self._started = False
         self._lock = InstanceLock(self.store.directory / "service.lock")
 
@@ -41,10 +45,12 @@ class Application:
         if not self._started:
             self._lock.acquire()
             try:
-                self.store.interrupt_pending()
+                self.events.bind()
+                await asyncio.to_thread(self.store.interrupt_pending)
                 if self.mihomo:
                     await self.mihomo.start()
-                    self.egress.import_nodes()
+                    await self.egress.import_nodes()
+                self.log_writer.start()
             except BaseException:
                 if self.mihomo:
                     await self.mihomo.close()
@@ -75,5 +81,8 @@ class Application:
                         if self.mihomo:
                             await self.mihomo.close()
         finally:
-            self.store.close()
-            self._lock.release()
+            try:
+                await asyncio.to_thread(self.log_writer.close)
+            finally:
+                self.store.close()
+                self._lock.release()

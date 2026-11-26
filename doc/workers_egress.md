@@ -37,7 +37,8 @@
   - 支持操作：`hello`（身份与真实可执行路径校验）、`probe`（探测公网出口 IP）、`connect`、`initialize`、`execute`、`disconnect`、`server_probe`、`cancel`（取消指定 `request_id` 任务）、`shutdown`。
 - **子 → 父响应格式**：`{"id": "<uuid>", "ok": true|false, "data": {...}, "error": {...}}`
 - **子 → 父异步事件**：
-  - `{"event": "log", "account_id": "...", "message": "..."}`
+  - `{"event": "log_batch", "items": [{"account_id": "...", "message": "...", "timestamp": "..."}]}`
+  - 父进程也接收旧版单条 `log` 事件。
   - `{"event": "steps", "request_id": "...", "steps": [...]}`
   - `{"event": "disconnected", "account_id": "...", "reason": "..."}`
 
@@ -47,6 +48,6 @@
 
 - **严格出口唯一性**：`EgressService._enable_check()` 禁止两个同时启用或仍有在线连接的出口分组拥有相同的公网 `exit_ip`；若某出口的 Worker 崩溃或 Mihomo 退出，会自动触发 `egress.failed()` 下线该组并唤醒等待队列。
 - **取消语义强一致**：父进程侧 `Worker._request()` 收到 `CancelledError` 时，会先向子进程发 `cancel` 并等待子进程真正停止操作，再释放父进程账号独占权，防止“父以为已取消、子仍在发包”。
-- **已知注意点**：
-  - `WorkerHost` 子进程侧 `handle()` 与 `send_steps()` 目前并发调用 `control_writer.drain()` 但未加写锁，高并发时应补充 `asyncio.Lock`。
-  - `prepare_worker_executable()` 会在创建/启动分组时同步读取可执行文件算 SHA256 或拷贝文件，建议在异步链路中放入线程池执行。
+- `WorkerHost.send()` 使用同一个写锁发送响应、步骤批次、日志批次及断线通知。日志在子进程按本组已知凭据脱敏，每 100 ms 或达到 50 条发送一批，最多缓冲 5,000 条。
+- 初始化、执行、探测、断开、取消和关停返回前发送待处理日志，保证父进程能在释放账号归属之前接收日志。父进程将步骤批次交给持久化写线程。
+- 创建和启动分组时通过线程池运行 `prepare_worker_executable()`。规则生成与进程启动共享文件准备锁，避免同时写同一路径。

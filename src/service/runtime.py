@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
 import re
+from threading import Lock
 from typing import Callable
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 from src.accounts.manager import AccountConnection, AccountSpec
 from src.service.contracts import ServiceError
@@ -24,10 +26,19 @@ class Redactor:
         "session_id", "session-id", "authorization", "loginkey", "wytoken",
         "secret", "ticket", "randstr",
     })
+    _KEYS = r"sid|token|session[_-]?id|password|pwd|loginkey|authorization|wytoken|secret|ticket|randstr"
+    _KV_SECRET_RE = re.compile(
+        rf'''(?i)(["']?\b(?:{_KEYS})["']?\s*[:=]\s*)(?:bearer\s+)?'''
+        r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|<redacted>|[^"'\s<>&;,}]+)'''
+    )
+    _XML_SECRET_RE = re.compile(rf"(?is)(<({_KEYS})\b[^>]*>).*?(</\2\s*>)")
+    _MARKERS = r"\[redacted\]|<redacted>"
 
     def __init__(self, store, *values):
         self.store = store
         self.values: set[str] = set()
+        self._values_pattern = None
+        self._values_lock = Lock()
         for value in values:
             self.collect(value)
 
@@ -35,7 +46,11 @@ class Redactor:
         if value is None or value == "":
             return
         value = str(value)
-        self.values.update({value, quote_plus(value), hashlib.md5(value.encode()).hexdigest()})
+        additions = {value, quote_plus(value), quote(value, safe=""), hashlib.md5(value.encode()).hexdigest()}
+        with self._values_lock:
+            if not additions.issubset(self.values):
+                self.values.update(additions)
+                self._values_pattern = None
         add_secret = getattr(self.store, "add_secret", None)
         if add_secret is not None:
             add_secret(value)
@@ -51,18 +66,27 @@ class Redactor:
             for item in value:
                 self.collect(item)
 
-    def clean(self, value: object, *, redact_global: bool = True) -> str:
-        text = str(value)
-        for secret in sorted(self.values, key=len, reverse=True):
-            text = text.replace(secret, "[redacted]")
-        text = re.sub(
-            r'(?i)(["\']?\b(?:sid|token|session_?id|password|pwd|loginkey|authorization|ticket|randstr)["\']?\s*[:=]\s*["\']?)[^"\'\s<>&;,}]+',
-            r"\1[redacted]", text,
-        )
-        text = re.sub(
-            r"(?is)(<(?:sid|token|sessionId|password|loginkey)\b[^>]*>).*?(</(?:sid|token|sessionId|password|loginkey)\s*>)",
-            r"\1[redacted]\2", text,
-        )
+    def clean(self, value: object, *, redact_global: bool = True, replacement="[redacted]") -> str:
+        def redact_pair(match):
+            quote_mark = match[2][0] if match[2][0] in "\"'" else ""
+            return match[1] + quote_mark + replacement + quote_mark
+
+        text = self._KV_SECRET_RE.sub(redact_pair, str(value))
+        text = self._XML_SECRET_RE.sub(lambda match: match[1] + replacement + match[3], text)
+        pattern = self._values_pattern
+        if pattern is None and self.values:
+            with self._values_lock:
+                if self._values_pattern is None:
+                    secrets = sorted(self.values, key=lambda secret: (-len(secret), secret))
+                    prefixes = defaultdict(list)
+                    for secret in secrets:
+                        prefixes[secret[:2]].append(re.escape(secret[2:]))
+                    branches = [re.escape(prefix) + "(?:" + "|".join(suffixes) + ")"
+                                for prefix, suffixes in prefixes.items()]
+                    self._values_pattern = re.compile(f"({self._MARKERS})|" + "|".join(branches))
+                pattern = self._values_pattern
+        if pattern is not None:
+            text = pattern.sub(lambda match: match[1] or replacement, text)
         redact = getattr(self.store, "redact", None)
         return redact(text) if redact_global and redact is not None else text
 
@@ -103,7 +127,7 @@ class SessionService:
         self.on_state = None
         self._lock = asyncio.Lock()
         self._maintenance: set[asyncio.Task] = set()
-        self.on_log: Callable[[str, str, str], None] | None = None
+        self.on_log: Callable[..., None] | None = None
 
     def _publish(self, session: _Session) -> None:
         self.events.publish("session", self._public(session))
@@ -278,10 +302,15 @@ class SessionService:
         self._claims = {key: owner for key, owner in self._claims.items() if owner != task_id}
         self._claim_accounts = {key: owner for key, owner in self._claim_accounts.items() if owner != task_id}
 
-    def _log(self, session: _Session, message: object) -> None:
+    def _log(self, session: _Session, message: object, *, redacted=False, timestamp=None) -> None:
         task_id = self._claim_accounts.get(session.account_id) or session.owner_task_id
         if task_id and self.on_log:
-            self.on_log(task_id, session.account_id, session.redactor.clean(message, redact_global=False))
+            if redacted:
+                self.on_log(task_id, session.account_id, message, redacted=True, timestamp=timestamp)
+            elif getattr(getattr(self, "store", None), "redact_log", None) is None:
+                self.on_log(task_id, session.account_id, session.redactor.clean(message, redact_global=False))
+            else:
+                self.on_log(task_id, session.account_id, message)
 
     def _observe_disconnect(self, session: _Session, reason: str) -> None:
         if session.state in {"offline", "disconnecting"}:
@@ -313,7 +342,7 @@ class SessionService:
                 connection = self._connection(session, account)
                 session.state = "connecting"
                 self._publish(session)
-                log = lambda message: self.on_log(task_id, account["account_id"], message) if self.on_log else None
+                log = lambda message, **options: self._log(session, message, **options)
                 await connection.probe_server(target, timeout, outcome, steps=steps, attempts=attempts,
                                               log=log, window=window, start_at=start_at, start_before=start_before)
         finally:
@@ -329,9 +358,8 @@ class SessionService:
             await self._disconnect(session)
         session = await self._lease(task_id, account)
         try:
-            async with self._login_slots:
-                self._connection(session, account)
-                return await self._connect(task_id, session, temporary=temporary)
+            self._connection(session, account)
+            return await self._connect(task_id, session, temporary=temporary)
         except BaseException:
             await self._disconnect(session)
             raise
@@ -341,10 +369,9 @@ class SessionService:
         session.state, session.error = "connecting", None
         self._publish(session)
         try:
-            connected = await session.connection.connect(retries=1)
+            async with self._login_slots:
+                connected = await session.connection.connect(retries=1)
             context = session.connection.context
-            if context is not None:
-                context.log_callback = lambda text: self._log(session, text)
             if not connected or context is None:
                 reason = getattr(session.connection, "login_block_reason", "")
                 verification = any(marker in str(reason).casefold() for marker in
@@ -359,7 +386,7 @@ class SessionService:
             login_result = getattr(context, "login_result", None)
             session.redactor.add(getattr(login_result, "session_id", ""))
             session.redactor.add(getattr(login_result, "user_id", ""))
-            context.log_callback = lambda text: self._log(session, text)
+            context.log_callback = lambda text, **options: self._log(session, text, **options)
             messages = getattr(context, "messages", None)
             observer = getattr(messages, "add_disconnect_observer", None)
             if observer is not None:

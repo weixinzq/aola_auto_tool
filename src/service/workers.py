@@ -1,5 +1,6 @@
 """Parent-side control RPC and connection adapters for isolated outbound groups."""
 import asyncio
+from inspect import isawaitable
 import json
 import os
 from pathlib import Path
@@ -42,7 +43,7 @@ class Worker:
                 return
             await asyncio.gather(*(task for task in (self.reader, self.stdout, self.stderr) if task is not None),
                                  return_exceptions=True)
-            executable = prepare_worker_executable(self.pool.directory, self.group_id)
+            executable = await asyncio.to_thread(prepare_worker_executable, self.pool.directory, self.group_id)
             self.state, self.error = "starting", None
             self.publish()
             listener = WorkerListener()
@@ -90,12 +91,18 @@ class Worker:
                     if future is not None and not future.done():
                         future.set_result(response)
                 elif response.get("event") == "steps":
-                    if response["request_id"] in self.step_callbacks:
-                        self.step_callbacks[response["request_id"]](response["steps"])
-                elif response.get("event") == "log":
-                    connection = self.connections.get(response.get("account_id"))
-                    if connection and connection.context:
-                        connection.context.log(response.get("message", ""))
+                    callback = self.step_callbacks.get(response["request_id"])
+                    if callback is not None:
+                        result = callback(response["steps"])
+                        if isawaitable(result):
+                            await result
+                elif response.get("event") in {"log", "log_batch"}:
+                    items = response["items"] if response["event"] == "log_batch" else [response]
+                    for item in items:
+                        connection = self.connections.get(item.get("account_id"))
+                        if connection and connection.context:
+                            connection.context.log(item.get("message", ""), redacted=True,
+                                                   timestamp=item.get("timestamp"))
                 elif response.get("event") == "disconnected":
                     connection = self.connections.get(response.get("account_id"))
                     if connection:
@@ -256,15 +263,19 @@ class RemoteContext:
     @log_callback.setter
     def log_callback(self, callback):
         self._log_callback = callback
-        for message in self._logs:
-            callback(message)
-        self._logs.clear()
+        if callback is not None:
+            for message, redacted, timestamp in self._logs:
+                self.log(message, redacted=redacted, timestamp=timestamp)
+            self._logs.clear()
 
-    def log(self, message):
+    def log(self, message, *, redacted=False, timestamp=None):
         if self._log_callback:
-            self._log_callback(message)
-        elif len(self._logs) < 200:
-            self._logs.append(message)
+            if redacted:
+                self._log_callback(message, redacted=True, timestamp=timestamp)
+            else:
+                self._log_callback(message)
+        elif len(self._logs) < 5000:
+            self._logs.append((message, redacted, timestamp))
 
     async def wait_for_player_initialization(self):
         await self.connection.worker.request("initialize", self.connection.account_id)

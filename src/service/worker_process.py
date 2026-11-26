@@ -5,8 +5,12 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from threading import Lock
 
 from src.service.contracts import ServiceError
+
+
+_prepare_lock = Lock()
 
 
 def worker_executable(directory, group_id):
@@ -17,20 +21,22 @@ def prepare_worker_executable(directory, group_id):
     if sys.platform not in {"win32", "linux"} or getattr(sys, "frozen", False):
         raise ServiceError("worker_platform", "出口执行进程需要 Windows/Linux Python 3.12 环境")
     target = worker_executable(directory, group_id)
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     base = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
     sources = [(base, target)]
     if os.name == "nt":
         for pattern in ("python*.dll", "vcruntime*.dll"):
             sources.extend((source, target.parent / source.name) for source in base.parent.glob(pattern))
-    for source, destination in sources:
-        if destination.exists():
-            if hashlib.sha256(source.read_bytes()).digest() != hashlib.sha256(destination.read_bytes()).digest():
-                raise ServiceError("worker_runtime_changed", "执行进程文件与当前 Python 不一致，请停服后移走该组运行目录")
-        else:
-            shutil.copy2(source, destination)
-        if os.name != "nt":
-            destination.chmod(0o700)
+    # Rule rendering and worker startup can prepare the same path concurrently.
+    with _prepare_lock:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for source, destination in sources:
+            if destination.exists():
+                if hashlib.sha256(source.read_bytes()).digest() != hashlib.sha256(destination.read_bytes()).digest():
+                    raise ServiceError("worker_runtime_changed", "执行进程文件与当前 Python 不一致，请停服后移走该组运行目录")
+            else:
+                shutil.copy2(source, destination)
+            if os.name != "nt":
+                destination.chmod(0o700)
     return target.resolve()
 
 
