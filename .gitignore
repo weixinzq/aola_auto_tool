@@ -18,6 +18,7 @@
 !/frontend/src/**/*.vue
 !/frontend/src/**/*.ts
 !/frontend/src/**/*.css
+!/doc/
 /frontend/src/**/*.test.ts
 
 # Local dependencies, generated output, and private task data.
