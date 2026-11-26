@@ -1,6 +1,5 @@
 """Parent-side control RPC and connection adapters for isolated outbound groups."""
 import asyncio
-from inspect import isawaitable
 import json
 import os
 from pathlib import Path
@@ -54,7 +53,8 @@ class Worker:
                 environment = worker_environment()
                 environment.pop('AOLA_PROXY_URL', None)
                 if self.pool.mihomo:
-                    policy = self.pool.store.get_egress_group(self.group_id)['clash_policy']
+                    group = await asyncio.to_thread(self.pool.store.get_egress_group, self.group_id)
+                    policy = group['clash_policy']
                     proxy_url = self.pool.mihomo.proxy_url(policy)
                     if proxy_url:
                         environment['AOLA_PROXY_URL'] = proxy_url
@@ -93,9 +93,7 @@ class Worker:
                 elif response.get("event") == "steps":
                     callback = self.step_callbacks.get(response["request_id"])
                     if callback is not None:
-                        result = callback(response["steps"])
-                        if isawaitable(result):
-                            await result
+                        callback(response["steps"])
                 elif response.get("event") in {"log", "log_batch"}:
                     items = response["items"] if response["event"] == "log_batch" else [response]
                     for item in items:
@@ -154,7 +152,7 @@ class Worker:
                 if not future.done():
                     future.set_exception(ServiceError("worker_lost", reason))
             if not self.closing and self.pool.on_lost:
-                self.pool.on_lost(self.group_id)
+                await self.pool.on_lost(self.group_id)
             self.publish()
 
     async def _request(self, operation, account_id=None, data=None, outcome=None, on_steps=None):

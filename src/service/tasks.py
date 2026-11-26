@@ -7,6 +7,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from uuid import uuid4
 
 from src.scripting.composer import execute_combination
@@ -62,6 +63,7 @@ class TaskService:
         self._runs: dict[str, _Run] = {}
         self._closing = False
         self._submission_lock = asyncio.Lock()
+        self._clear_lock = Lock()
         self.sessions.on_log = self._log
         self.sessions.on_state = self._session_state
 
@@ -85,7 +87,9 @@ class TaskService:
         spec = spec.model_copy(deep=True) if isinstance(spec, TaskSpec) else TaskSpec.model_validate(spec)
         if not spec.account_ids or len(set(spec.account_ids)) != len(spec.account_ids):
             raise ServiceError("invalid_accounts", "请选择不重复的目标账号")
-        accounts = [self.store.get_account(account_id, private=True) for account_id in spec.account_ids]
+        batch_lookup = getattr(self.store, "get_accounts_by_ids", None)
+        accounts = (batch_lookup(spec.account_ids, private=True) if batch_lookup is not None else
+                    [self.store.get_account(account_id, private=True) for account_id in spec.account_ids])
         if spec.kind == "server_probe" and not spec.probe_staggered:
             accounts = accounts[:len(spec.server_targets)]
         steps = ()
@@ -101,7 +105,12 @@ class TaskService:
         return spec, accounts, steps
 
     def validate(self, spec) -> dict:
-        spec, accounts, steps = self._prepare(spec)
+        return self._validate(*self._prepare(spec))
+
+    async def validate_async(self, spec) -> dict:
+        return self._validate(*await asyncio.to_thread(self._prepare, spec))
+
+    def _validate(self, spec, accounts, steps) -> dict:
         capacity = self.sessions.check(spec, accounts)
         result = {"valid": True, "account_count": len(accounts), "step_count": len(steps),
                   "spec": _snapshot(spec), **capacity}
@@ -180,7 +189,7 @@ class TaskService:
     async def _submit(self, spec) -> dict:
         if self._closing:
             raise ServiceError("service_stopping", "服务正在关闭", 503)
-        spec, accounts, steps = self._prepare(spec)
+        spec, accounts, steps = await asyncio.to_thread(self._prepare, spec)
         task_id = uuid4().hex
         skipped = {row["account_id"]: row for row in await self.sessions.reserve(task_id, spec, accounts)}
         record = {
@@ -219,11 +228,15 @@ class TaskService:
         return self.store.list_task_summaries()
 
     def clear_finished(self) -> dict:
-        task_ids = [record["task_id"] for record in self.list()
-                    if record["state"] in _TERMINAL and record["task_id"] not in self._runs]
-        self.store.delete_tasks(task_ids)
-        if task_ids:
-            self.events.publish("task", {"deleted_task_ids": task_ids})
+        with self._clear_lock:
+            task_ids = [record["task_id"] for record in self.list()
+                        if record["state"] in _TERMINAL and record["task_id"] not in self._runs]
+            if task_ids:
+                # A terminal snapshot can now commit ahead of its last queued logs.
+                if self.log_writer is not None:
+                    self.log_writer.flush()
+                self.store.delete_tasks(task_ids)
+                self.events.publish("task", {"deleted_task_ids": task_ids})
         return {"deleted_count": len(task_ids), "task_ids": task_ids}
 
     def get(self, task_id: str) -> dict:
@@ -239,7 +252,7 @@ class TaskService:
         else:
             if self.log_writer is not None and any(
                     row.get("_step_results_streamed") for row in snapshot["account_results"]):
-                self.log_writer.flush()
+                self.log_writer.flush(logs=False)
             details = getattr(self.store, "get_task_details", self.store.redact)
             record = details(snapshot)
         return record if render is None else render(record)
@@ -271,10 +284,13 @@ class TaskService:
             result["server_results"] = task.get("server_results", [])
         return result
 
-    def logs(self, task_id: str, after=0, limit=200):
+    def logs(self, task_id: str, after=0, limit=200, *, flush=False):
         if self.log_writer is not None:
-            self.log_writer.flush()
-            self.store.get_task_summary(task_id)
+            active = task_id in self._runs
+            if flush or not active:
+                self.log_writer.flush()
+            if not active:
+                self.store.get_task_summary(task_id)
         else:
             self.get(task_id)
         return self.store.get_logs(task_id, after=after, limit=limit)
@@ -285,7 +301,7 @@ class TaskService:
             return record
         run = self._runs.get(task_id)
         if run is None:
-            record = self.get(task_id)
+            record = await self.get_async(task_id) if self.log_writer is not None else self.get(task_id)
             if record["state"] in _TERMINAL:
                 return record
             raise ServiceError("task_unavailable", "任务不属于当前运行进程", 409)
@@ -336,17 +352,22 @@ class TaskService:
         streamed = hasattr(self.store, "append_task_steps")
         first_error = None
 
-        async def save_steps(records):
+        def save_steps(records):
             nonlocal first_error
-            for step in records:
-                if step["error"]:
-                    if first_error is None and not step.get("skipped", False):
-                        first_error = step["error"]
-                    step["error"] = run.redactor.clean(step["error"])
+            if first_error is None:
+                first_error = next((step["error"] for step in records
+                                    if step["error"] and not step.get("skipped", False)), None)
             if self.log_writer is not None:
-                await self.log_writer.enqueue_steps(run.record["task_id"], account_id, records)
+                self.log_writer.enqueue_steps(run.record["task_id"], account_id, records)
             else:
+                for step in records:
+                    if step["error"]:
+                        step["error"] = run.redactor.clean(step["error"])
                 self.store.append_task_steps(run.record["task_id"], account_id, records)
+
+        async def save_local_steps(records):
+            save_steps(records)
+            if self.log_writer is None:
                 await asyncio.sleep(0)
 
         if streamed:
@@ -359,7 +380,7 @@ class TaskService:
                              **({"on_steps": save_steps} if streamed else {}), **options)
             else:
                 await run_execution(account_id, context, run.steps, outcome, executor=self.executor,
-                                    on_steps=save_steps if streamed else None, **options)
+                                    on_steps=save_local_steps if streamed else None, **options)
         except BaseException:
             row.pop("_step_results_streamed", None)
             raise

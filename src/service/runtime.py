@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 import hashlib
 import re
@@ -143,8 +143,14 @@ class SessionService:
         }
 
     def list(self) -> list[dict]:
+        return self._list(self.store.list_accounts())
+
+    async def list_async(self) -> list[dict]:
+        return self._list(await asyncio.to_thread(self.store.list_accounts))
+
+    def _list(self, accounts) -> list[dict]:
         rows = []
-        for account in self.store.list_accounts():
+        for account in accounts:
             session = self._sessions.get(account["account_id"])
             if session is not None and session.state == "ready" and not session.connection.online:
                 self._observe_disconnect(session,
@@ -172,14 +178,13 @@ class SessionService:
     def wake(self):
         # All grants are synchronous on the service event loop: no capacity can be
         # observed and consumed by two requests between the check and the grant.
-        candidates = self.egress.available() if self.egress else []
+        candidates = self.egress.available() if self._waiting and self.egress else []
+        usage = Counter(s.exit_ip for s in self._sessions.values() if s.slot) if candidates else Counter()
         while self._waiting:
             session, future = self._waiting[0]
             if future.done():
                 self._waiting.pop(0)
                 continue
-            usage = {g["exit_ip"]: sum(s.slot and s.exit_ip == g["exit_ip"]
-                                      for s in self._sessions.values()) for g in candidates}
             available = [g for g in candidates if usage[g["exit_ip"]] < 25]
             if not available:
                 break
@@ -188,6 +193,7 @@ class SessionService:
             self._turn += 1
             self._last_used[group["group_id"]] = self._turn
             session.egress_group_id, session.exit_ip = group["group_id"], group["exit_ip"]
+            usage[session.exit_ip] += 1
             session.slot = True
             session.state = "connecting"
             future.set_result(None)
@@ -224,11 +230,12 @@ class SessionService:
         session.connection = self.connection_factory(AccountSpec(account.get("label", session.account_id), config))
         return session.connection
 
-    def is_busy(self, account_id: str) -> bool:
+    def is_busy(self, account_id: str, *, account=None) -> bool:
         session = self._sessions.get(account_id)
         if account_id in self._claim_accounts or (session is not None and session.slot):
             return True
-        account = self.store.get_account(account_id, private=True)
+        if account is None:
+            account = self.store.get_account(account_id, private=True)
         identity = account_identity(account)
         return identity in self._claims or any(
             item.identity == identity and item.slot for item in self._sessions.values()

@@ -1,4 +1,6 @@
 """Account configuration ownership, independent of live sessions."""
+import asyncio
+
 from src.accounts.manager import load_account_specs
 from src.service.contracts import AccountInput, AccountPatch, ServiceError
 
@@ -40,13 +42,21 @@ class AccountService:
         self.events.publish("account", row)
         return row
 
-    def _assert_idle(self, account_id):
-        if self.sessions.is_busy(account_id):
+    def _assert_idle(self, account_id, **options):
+        if self.sessions.is_busy(account_id, **options):
             raise ServiceError("account_busy", "账号在线或正被任务占用，请先断开并等待清理", 409)
 
     def update(self, account_id, payload):
         self._assert_idle(account_id)
         original = self.store.get_account(account_id, private=True)
+        return self._update(account_id, payload, original)
+
+    async def update_async(self, account_id, payload):
+        original = await asyncio.to_thread(self.store.get_account, account_id, private=True)
+        self._assert_idle(account_id, account=original)
+        return await asyncio.to_thread(self._update, account_id, payload, original)
+
+    def _update(self, account_id, payload, original):
         patch = payload if isinstance(payload, AccountPatch) else AccountPatch.model_validate(payload)
         raw = {key: value for key, value in original.items() if key != "account_id"}
         raw.update(patch.model_dump(exclude_none=True))
@@ -63,6 +73,14 @@ class AccountService:
 
     def delete(self, account_id):
         self._assert_idle(account_id)
+        self._delete(account_id)
+
+    async def delete_async(self, account_id):
+        original = await asyncio.to_thread(self.store.get_account, account_id, private=True)
+        self._assert_idle(account_id, account=original)
+        await asyncio.to_thread(self._delete, account_id)
+
+    def _delete(self, account_id):
         self.store.delete_account(account_id)
         self.events.publish("account", {"account_id": account_id, "deleted": True})
 

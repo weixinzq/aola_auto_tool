@@ -82,9 +82,10 @@
 
 - 控制面由 `cli_main.py serve` 以 `uvicorn(..., workers=1)` 启动，`InstanceLock` 保证同一数据目录只有一个服务实例。
 - 每个出口 IP 最多承载 25 个在线会话。全局登录信号量默认为 20，连接握手完成便释放该名额。HTTP 单次会话操作允许指定最高 500 的并发度。
-- 日志和步骤由单个后台线程批量写入 SQLite。活动任务详情读内存快照，Worker 日志完成源头脱敏后合批传输，任务 SSE 发送已落盘的日志批次。
-- 在项目根目录运行 `python -m unittest discover -s tests -p test_300_concurrency.py` 验证脱敏、关停落盘、留存、只读查询和登录名额。运行 `python -m tests.benchmark_300_concurrency` 执行 30 秒本机回环压测。
-- 本机回环压测使用 12 组、300 个模拟会话。30 秒产生 45,000 条日志，全部落盘并送达任务详情 SSE，全局 SSE 收到 0 条日志。健康检查 P99 为 27.68 ms，任务详情 P99 为 36.15 ms，日志队列采样峰值为 300 条，工作集由 135.5 MiB 增至 151.9 MiB。
+- SQLite 单写线程优先处理任务快照与步骤，日志走独立有界队列。控制指令在当前事务结束后取得优先权。单批锁错误按限次退避重试，最终失败只影响该批。
+- 出口调度使用配置缓存，提交与预检批量读取账号。活动日志轮询读取已落盘的数据，任务详情 SSE 继续推送每批提交的日志。
+- 在项目根目录运行 `python -m unittest tests.test_api_cli tests.test_300_concurrency -v` 验证控制队列、锁错误恢复、脱敏、关停、日志查询和 IPC。运行 `python -m tests.benchmark_300_concurrency` 执行含日志分页轮询的 30 秒本机回环压测。
+- 本机回环压测使用 12 组、300 个模拟会话，独立客户端进程并发轮询健康检查、任务详情与日志分页，并保持两个 SSE 连接。30 秒内 45,000 条日志全部落盘并送达任务详情 SSE，全局 SSE 收到 0 条日志。健康检查 P99 为 42.04 ms，任务详情为 44.92 ms，日志分页为 54.03 ms。写入失败和日志丢弃均为 0，日志队列采样峰值为 600 条。
 
 ---
 
@@ -95,3 +96,4 @@
 | 2026-11-26 | 建立初始架构文档体系（`doc/main.md` 及 6 份模块子文档），完成全仓库模块盘点与高并发瓶颈基线记录。 | 全部子文档 |
 | 2026-11-26 | 完成 300 会话并发改造，加入 SQLite 批量写入和留存、按来源脱敏、任务快照异步持久化、Worker IPC 与 SSE 合批，并调整会话操作并发上限。 | [服务编排](./service_orchestration.md)、[存储](./storage_persistence.md)、[Worker 与出口](./workers_egress.md)、[HTTP 与前端](./interfaces_frontend.md) |
 | 2026-11-26 | 将旧 API 测试迁移到当前 HTTP 和 CLI 契约。14 项 API 用例及另外 58 项并发、存储和 Worker 回归通过。 | [HTTP 与前端](./interfaces_frontend.md) |
+| 2026-11-26 | 拆分持久化控制与日志队列，增加锁错误重试和故障隔离，缓存出口配置，移出主循环的数据库调用，并解除日志轮询与 Worker 步骤的反压。80 项回归及 30 秒本机压测通过。 | [服务编排](./service_orchestration.md)、[存储](./storage_persistence.md)、[Worker 与出口](./workers_egress.md)、[HTTP 与前端](./interfaces_frontend.md) |

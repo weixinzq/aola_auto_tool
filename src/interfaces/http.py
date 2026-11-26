@@ -155,7 +155,9 @@ def create_app(
 
     @api.post("/accounts/assign-egress", response_model=EgressAssignmentResult)
     async def assign_egress(body: EgressAssignment, request: Request):
-        return request.app.state.application.accounts.assign_egress(body.account_ids, body.egress_group_id)
+        async with account_write_lock:
+            return await run_in_threadpool(request.app.state.application.accounts.assign_egress,
+                                           body.account_ids, body.egress_group_id)
 
     @api.get("/egress-groups", response_model=list[EgressGroupRecord])
     async def egress_groups(request: Request):
@@ -195,17 +197,19 @@ def create_app(
 
     @api.patch("/accounts/{account_id}", response_model=AccountRecord)
     async def update_account(account_id: str, body: AccountPatch, request: Request):
-        async with account_write_lock:
-            return request.app.state.application.accounts.update(account_id, body)
+        application = request.app.state.application
+        async with account_write_lock, application.tasks._submission_lock:
+            return await application.accounts.update_async(account_id, body)
 
     @api.delete("/accounts/{account_id}", status_code=204)
     async def delete_account(account_id: str, request: Request):
-        async with account_write_lock:
-            request.app.state.application.accounts.delete(account_id)
+        application = request.app.state.application
+        async with account_write_lock, application.tasks._submission_lock:
+            await application.accounts.delete_async(account_id)
 
     @api.get("/sessions", response_model=list[SessionRecord])
     async def sessions(request: Request):
-        return request.app.state.application.sessions.list()
+        return await request.app.state.application.sessions.list_async()
 
     async def session_operation(kind: str, body: SessionInput, request: Request):
         spec = TaskSpec(kind=kind, account_ids=body.account_ids, concurrency=body.concurrency)
@@ -237,7 +241,7 @@ def create_app(
 
     @api.post("/tasks/validate", response_model=TaskPreflight)
     async def validate_task(body: ScriptTaskInput, request: Request):
-        return request.app.state.application.tasks.validate(body.to_spec())
+        return await request.app.state.application.tasks.validate_async(body.to_spec())
 
     @api.post("/tasks", status_code=202, response_model=TaskRecord)
     async def start_task(body: ScriptTaskInput, request: Request):
@@ -247,7 +251,7 @@ def create_app(
     async def validate_probe(body: TaskSpec, request: Request):
         if body.kind != "server_probe":
             raise ServiceError("invalid_task", "仅支持服务器探测")
-        return request.app.state.application.tasks.validate(body)
+        return await request.app.state.application.tasks.validate_async(body)
 
     @api.post("/server-probes", status_code=202, response_model=TaskRecord)
     async def start_probe(body: TaskSpec, request: Request):
@@ -261,7 +265,7 @@ def create_app(
 
     @api.delete("/tasks", response_model=TaskClearResult)
     async def clear_tasks(request: Request):
-        return request.app.state.application.tasks.clear_finished()
+        return await run_in_threadpool(request.app.state.application.tasks.clear_finished)
 
     @api.get("/tasks/{task_id}", response_model=TaskRecord)
     async def task(task_id: str, request: Request):
@@ -279,7 +283,9 @@ def create_app(
     @api.get("/tasks/{task_id}/logs", response_model=list[LogEntry])
     def logs(task_id: str, request: Request,
              after: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000)):
-        return request.app.state.application.tasks.logs(task_id, after=after, limit=limit)
+        # Store returns the LogEntry columns directly. Render in the same thread as the read.
+        rows = request.app.state.application.tasks.logs(task_id, after=after, limit=limit)
+        return JSONResponse(rows)
 
     @api.get("/events", response_class=StreamingResponse,
              responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}})

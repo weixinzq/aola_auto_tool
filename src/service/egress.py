@@ -14,18 +14,37 @@ class EgressService:
         self._changing = set()
         self._verified = set()
         self._creating = set()
+        self._groups_cache: dict[str, dict] | None = None
+        self._write_lock = asyncio.Lock()
+
+    async def load(self):
+        groups = await asyncio.to_thread(self.store.list_egress_groups)
+        self._groups_cache = {group["group_id"]: group for group in groups}
+
+    def _groups(self):
+        if self._groups_cache is None:
+            self._groups_cache = {group["group_id"]: group for group in self.store.list_egress_groups()}
+        return self._groups_cache
+
+    def _group(self, group_id):
+        group = self._groups().get(group_id)
+        if group is None:
+            raise ServiceError("egress_not_found", "出口分组不存在", 404)
+        return group
 
     def get(self, group_id):
-        return self._profile(self.store.get_egress_group(group_id))
+        return self._profile(self._group(group_id))
 
     async def get_async(self, group_id):
-        return self._profile(await asyncio.to_thread(self.store.get_egress_group, group_id))
+        if self._groups_cache is None:
+            await self.load()
+        return self.get(group_id)
 
     def _profile(self, group):
         group_id = group["group_id"]
         if self.workers.mihomo:
-            group['routing_confirmed'] = group['clash_policy'] == 'DIRECT' or (
-                self.workers.mihomo.state == 'ready' and group['clash_policy'] in self.workers.mihomo.nodes)
+            group = {**group, 'routing_confirmed': group['clash_policy'] == 'DIRECT' or (
+                self.workers.mihomo.state == 'ready' and group['clash_policy'] in self.workers.mihomo.nodes)}
         profile = self.workers.profile(group_id)
         return {**group, "max_online": 25, "enabled": group.get("enabled", False),
                 **profile, **self.sessions.egress_usage(group_id),
@@ -34,14 +53,17 @@ class EgressService:
                 "waiting_count": self.sessions.waiting_count}
 
     def list(self):
-        return [self._profile(group) for group in self.store.list_egress_groups()]
+        return [self._profile(group) for group in self._groups().values()]
 
     async def list_async(self):
-        groups = await asyncio.to_thread(self.store.list_egress_groups)
-        return [self._profile(group) for group in groups]
+        if self._groups_cache is None:
+            await self.load()
+        return self.list()
 
     def available(self):
-        return [group for group in self.list() if group["active"] and group.get("exit_ip")]
+        candidates = (self._profile(group) for group_id, group in (self._groups_cache or {}).items()
+                      if group.get("enabled") and group_id in self._verified and group_id not in self._changing)
+        return [group for group in candidates if group["active"] and group.get("exit_ip")]
 
     def check(self, group_id, *, connecting=False):
         if group_id in self._changing:
@@ -72,31 +94,43 @@ class EgressService:
             value = value.model_copy(update={'routing_confirmed': True})
         if value.enabled:
             raise ServiceError("egress_unconfirmed", "新出口须先检测并确认后启用", 409)
-        if value.name in self._creating or any(group["name"] == value.name for group in self.list()):
+        if value.name in self._creating:
             raise ServiceError("egress_duplicate", "出口名称已存在", 409)
+        self._check_name(value.name)
         return value
+
+    def _check_name(self, name, group_id=None):
+        if any(group["name"] == name and key != group_id for key, group in self._groups().items()):
+            raise ServiceError("egress_duplicate", "出口名称已存在", 409)
 
     def create(self, value):
         value, group_id = self._new_group(value), uuid4().hex
         prepare_worker_executable(self.store.directory, group_id)
-        return self._save_group(group_id, value)
+        self._remember(self.store.save_egress_group(group_id, value.model_dump()))
+        return self.get(group_id)
 
     async def create_async(self, value):
         value, group_id = self._new_group(value), uuid4().hex
         self._creating.add(value.name)
         try:
             await asyncio.to_thread(prepare_worker_executable, self.store.directory, group_id)
-            return self._save_group(group_id, value)
+            async with self._write_lock:
+                self._check_name(value.name)
+                await self._save_group(group_id, value.model_dump())
+            return self.get(group_id)
         finally:
             self._creating.discard(value.name)
 
-    def _save_group(self, group_id, value):
-        self.store.save_egress_group(group_id, value.model_dump())
-        self.events.publish("egress", {"group_id": group_id})
-        return self.get(group_id)
+    async def _save_group(self, group_id, config):
+        group = await asyncio.to_thread(self.store.save_egress_group, group_id, config)
+        self._remember(group)
+
+    def _remember(self, group):
+        self._groups()[group["group_id"]] = group
+        self.events.publish("egress", {"group_id": group["group_id"]})
 
     async def import_nodes(self):
-        groups = self.store.list_egress_groups()
+        groups = self._groups().values()
         policies = {group['clash_policy'] for group in groups}
         names = {group['name'] for group in groups}
         for node in self.workers.mihomo.nodes:
@@ -122,8 +156,9 @@ class EgressService:
         if self.workers.mihomo:
             self.workers.mihomo.validate_policy(value.clash_policy)
             value = value.model_copy(update={'routing_confirmed': True})
-        if value.name in self._creating or any(g["name"] == value.name and g["group_id"] != group_id for g in self.list()):
+        if value.name in self._creating:
             raise ServiceError("egress_duplicate", "出口名称已存在", 409)
+        self._check_name(value.name, group_id)
         route_changed = original["clash_policy"] != value.clash_policy
         if route_changed:
             self._idle(group_id)
@@ -134,10 +169,12 @@ class EgressService:
             if route_changed:
                 self._verified.discard(group_id)
                 await self.workers.stop(group_id)
-            self.store.save_egress_group(group_id, value.model_dump())
+            async with self._write_lock:
+                self._check_name(value.name, group_id)
+                self._enable_check(group_id, value)
+                await self._save_group(group_id, value.model_dump())
         finally:
             self._changing.discard(group_id)
-        self.events.publish("egress", {"group_id": group_id})
         self.sessions.wake()
         return self.get(group_id)
 
@@ -148,7 +185,9 @@ class EgressService:
         try:
             self._verified.discard(group_id)
             await self.workers.stop(group_id)
-            self.store.delete_egress_group(group_id)
+            async with self._write_lock:
+                await asyncio.to_thread(self.store.delete_egress_group, group_id)
+                self._groups().pop(group_id, None)
         finally:
             self._changing.discard(group_id)
         self.events.publish("egress", {"group_id": group_id, "deleted": True})
@@ -156,15 +195,22 @@ class EgressService:
 
     def failed(self, group_id):
         self._verified.discard(group_id)
-        group = self.store.get_egress_group(group_id)
-        self.store.save_egress_group(group_id, {**group, "enabled": False})
-        self.events.publish("egress", {"group_id": group_id})
+        group = self._group(group_id)
+        self._remember(self.store.save_egress_group(group_id, {**group, "enabled": False}))
+        self.sessions.wake()
+
+    async def failed_async(self, group_id):
+        self._verified.discard(group_id)
+        async with self._write_lock:
+            group = self._groups().get(group_id)
+            if group is not None:
+                await self._save_group(group_id, {**group, "enabled": False})
         self.sessions.wake()
 
     async def probe(self, group_id):
         self.check(group_id)
         if self.workers.mihomo:
-            group = self.store.get_egress_group(group_id)
+            group = self._group(group_id)
             self.workers.mihomo.proxy_url(group['clash_policy'])
         self._idle(group_id)
         self._verified.discard(group_id)
@@ -177,7 +223,7 @@ class EgressService:
             self._enable_check(group_id, EgressGroupInput.model_validate(
                 {k: v for k, v in group.items() if k in EgressGroupInput.model_fields}))
         except BaseException:
-            self.failed(group_id)
+            await self.failed_async(group_id)
             raise
         finally:
             self._changing.discard(group_id)

@@ -38,7 +38,7 @@
 `offline` → `waiting_egress`（等待出口 IP 池名额）→ `connecting`（等待并取得 `_login_slots` 执行连接握手）→ `initializing`（释放登录名额后等待玩家初始化）→ `ready` → `disconnecting` → `offline`
 
 - **账号互斥机制**：按归一化登录账号 `account_identity(account)` 维护 `_claims`，在 `SessionService.reserve()`（由 `self._lock` 保护）中原子校验并抢占，确保同一账号不会被两个任务同时操作。
-- **容量唤醒机制**：`SessionService.wake()` 在事件循环上同步执行，从 `_waiting` FIFO 队列中按“当前在线数最少 + 最久未使用（LRU）”原则分配活跃出口分组（每公网 IP 上限 25 在线）。
+- `SessionService.wake()` 从内存出口配置和实时会话状态分配名额。等待队列按 FIFO，分组优先选在线数最少、最久未用的出口，每个公网 IP 上限 25 在线。
 
 ### 3.2 任务生命周期 (`TaskService`)
 `queued` → `running` → (`cancelling`) → `succeeded` / `failed` / `cancelled` / `interrupted`
@@ -53,5 +53,6 @@
 ## 4. 维护注意点
 
 - `TaskService._log()` 把运行日志交给 `BatchLogWriter`。子进程日志携带内部脱敏标志，父进程日志由写线程使用全库凭据脱敏。
-- 活动任务详情从内存快照读取。已完成账号的流式步骤在拼接前等待已入队批次提交。中间任务快照以 200 ms 防抖频率落盘，任务提交与终态等待各自快照写入完成。
+- 任务提交和预检在工作线程批量读取账号，再在事件循环上检查会话状态。修改或删除账号时与任务提交互斥，数据库操作在线程池执行。
+- 活动任务详情从内存快照读取。拼接流式步骤前只等待控制队列。中间快照每 200 ms 防抖持久化，任务提交与终态各自等待快照保存。
 - **服务重启恢复**：`Application.start()` 会调用 `store.interrupt_pending()`，将上次异常退出遗留的 `queued`/`running`/`cancelling` 任务统一标记为 `interrupted`（不自动重放）。

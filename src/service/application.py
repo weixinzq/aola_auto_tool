@@ -32,7 +32,7 @@ class Application:
                                        max_online=max_online, login_concurrency=login_concurrency)
         self.egress = EgressService(self.store, self.sessions, self.workers, self.events)
         self.sessions.egress = self.egress
-        self.workers.on_lost = self.egress.failed
+        self.workers.on_lost = self.egress.failed_async
         if self.mihomo:
             self.mihomo.on_lost = self.proxy_lost
         self.accounts = AccountService(self.store, self.sessions, self.events, self.egress)
@@ -47,6 +47,7 @@ class Application:
             try:
                 self.events.bind()
                 await asyncio.to_thread(self.store.interrupt_pending)
+                await self.egress.load()
                 if self.mihomo:
                     await self.mihomo.start()
                     await self.egress.import_nodes()
@@ -60,9 +61,9 @@ class Application:
             self._started = True
 
     async def proxy_lost(self):
-        for group in self.store.list_egress_groups():
+        for group in self.egress.list():
             if group['clash_policy'] != 'DIRECT':
-                self.egress.failed(group['group_id'])
+                await self.egress.failed_async(group['group_id'])
                 worker = self.workers.workers.get(group['group_id'])
                 if worker:
                     await worker.lost('Mihomo 已退出，代理连接已停止')

@@ -7,6 +7,7 @@ import ctypes
 import json
 import logging
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import socket
@@ -16,10 +17,6 @@ from time import perf_counter
 from types import SimpleNamespace
 
 import httpx
-import uvicorn
-
-from src.interfaces.http import create_app
-from src.service.application import Application
 
 
 ACCOUNT_COUNT = 300
@@ -81,12 +78,73 @@ async def wait_until(predicate, timeout=30):
             await asyncio.sleep(.01)
 
 
+async def probe_http(url, task_id, ready, done, expected):
+    counts = Counter()
+    connected = [asyncio.Event(), asyncio.Event()]
+    task_path = f"/api/v1/tasks/{task_id}"
+    async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=httpx.Timeout(15, read=None)) as client:
+        async def stream(index):
+            path = "/api/v1/events" + (f"?task_id={task_id}" if index else "")
+            async with client.stream("GET", path) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line == ": connected":
+                        connected[index].set()
+                    elif line.startswith("data: "):
+                        item = json.loads(line[6:])
+                        counts[index, item["event"]] += 1
+                        if index:
+                            assert item["data"]["task_id"] == task_id
+
+        async def poll(path, *, paginated=False):
+            samples = []
+            cursor = 0
+            while not done.is_set():
+                before = perf_counter()
+                params = {"after": cursor, "limit": 500} if paginated else None
+                response = await client.get(path, params=params)
+                response.raise_for_status()
+                samples.append((perf_counter() - before) * 1000)
+                if paginated:
+                    logs = response.json()
+                    if logs:
+                        assert logs[0]["id"] > cursor
+                        cursor = logs[-1]["id"]
+                await asyncio.sleep(.1 if paginated else .025)
+            return samples
+
+        streams = [asyncio.create_task(stream(index)) for index in range(2)]
+        try:
+            await wait_until(lambda: all(flag.is_set() for flag in connected))
+            ready.set()
+            health, detail, log_poll = await asyncio.gather(
+                poll("/api/v1/health"), poll(task_path), poll(task_path + "/logs", paginated=True))
+            await wait_until(lambda: counts[1, "log"] == expected or any(t.done() for t in streams))
+            for task in streams:
+                if task.done():
+                    task.result()
+            return counts, health, detail, log_poll
+        finally:
+            for task in streams:
+                task.cancel()
+            await asyncio.gather(*streams, return_exceptions=True)
+
+
+def probe_process(url, task_id, ready, done, expected, result):
+    with result:
+        result.send(asyncio.run(probe_http(url, task_id, ready, done, expected)))
+
+
 async def simulate(directory, duration):
+    import uvicorn
+    from src.interfaces.http import create_app
+    from src.service.application import Application
+
     ticks = round(duration / INTERVAL)
     expected = ticks * ACCOUNT_COUNT
-    start, done = asyncio.Event(), asyncio.Event()
+    context = multiprocessing.get_context("spawn")
+    start, done = asyncio.Event(), context.Event()
     arrived = 0
-    counts = Counter()
     loop = asyncio.get_running_loop()
     start_at = 0
 
@@ -130,7 +188,8 @@ async def simulate(directory, duration):
     handler = CheckErrors()
     logging.getLogger().addHandler(handler)
     logging.getLogger("uvicorn").addHandler(handler)
-    probes, streams = [], []
+    probes = resources = None
+    receive, send = context.Pipe(duplex=False)
 
     try:
         with socket.socket() as listener:
@@ -140,7 +199,8 @@ async def simulate(directory, duration):
             try:
                 await wait_until(lambda: server.started or serving.done())
                 assert server.started
-                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False,
+                url = f"http://127.0.0.1:{port}"
+                async with httpx.AsyncClient(base_url=url, trust_env=False,
                                              timeout=httpx.Timeout(15, read=None)) as client:
                     response = await client.post("/api/v1/sessions/connect",
                                                  json={"account_ids": ids, "concurrency": ACCOUNT_COUNT})
@@ -158,65 +218,46 @@ async def simulate(directory, duration):
                             {"id": -1, "cmd": "#time", "param": {"seconds": 0}}]}]})
                     response.raise_for_status()
                     task_id = response.json()["task_id"]
-                    task_path = f"/api/v1/tasks/{task_id}"
                     run = app.tasks._runs[task_id]
-                    connected = [asyncio.Event(), asyncio.Event()]
+                ready = context.Event()
+                probes = context.Process(target=probe_process, args=(url, task_id, ready, done, expected, send))
+                probes.start()
+                send.close()
+                await wait_until(lambda: ready.is_set() or not probes.is_alive())
+                assert ready.is_set(), "HTTP probe process exited before subscribing"
+                await wait_until(lambda: arrived == ACCOUNT_COUNT)
 
-                    async def stream(index):
-                        path = "/api/v1/events" + (f"?task_id={task_id}" if index else "")
-                        async with client.stream("GET", path) as response:
-                            response.raise_for_status()
-                            async for line in response.aiter_lines():
-                                if line == ": connected":
-                                    connected[index].set()
-                                elif line.startswith("data: "):
-                                    event = json.loads(line[6:])
-                                    counts[index, event["event"]] += 1
-                                    if index:
-                                        assert event["data"]["task_id"] == task_id
+                async def sample_resources():
+                    memory, queues = [], []
+                    while not done.is_set():
+                        memory.append(working_set() or 0)
+                        queues.append(app.log_writer.log_queue.qsize())
+                        await asyncio.sleep(.05)
+                    return memory, queues
 
-                    streams = [asyncio.create_task(stream(index)) for index in range(2)]
-                    await wait_until(lambda: arrived == ACCOUNT_COUNT and all(event.is_set() for event in connected))
-
-                    async def poll(path):
-                        samples = []
-                        while not done.is_set():
-                            before = perf_counter()
-                            response = await client.get(path)
-                            response.raise_for_status()
-                            samples.append((perf_counter() - before) * 1000)
-                            await asyncio.sleep(.025)
-                        return samples
-
-                    async def sample_resources():
-                        memory, queues = [], []
-                        while not done.is_set():
-                            memory.append(working_set() or 0)
-                            queues.append(app.log_writer.queue.qsize())
-                            await asyncio.sleep(.05)
-                        return memory, queues
-
-                    probes = [asyncio.create_task(poll(path)) for path in ("/api/v1/health", task_path)]
-                    resources = asyncio.create_task(sample_resources())
-                    probes.append(resources)
-                    start_at = loop.time() + .02
-                    start.set()
-                    await asyncio.wait_for(asyncio.shield(run.task), duration + 15)
-                    done.set()
-                    health, detail, (memory, queues) = await asyncio.gather(*probes)
-                    await wait_until(lambda: counts[1, "log"] == expected or any(t.done() for t in streams))
-                    for stream_task in streams:
-                        if stream_task.done():
-                            stream_task.result()
-                    assert app.tasks.get(task_id)["state"] == "succeeded"
+                resources = asyncio.create_task(sample_resources())
+                start_at = loop.time() + .02
+                start.set()
+                await asyncio.wait_for(asyncio.shield(run.task), duration + 15)
+                done.set()
+                memory, queues = await resources
+                assert await asyncio.to_thread(receive.poll, 15), "HTTP probes did not finish"
+                counts, health, detail, log_poll = await asyncio.to_thread(receive.recv)
+                assert app.tasks.get(task_id)["state"] == "succeeded"
             finally:
                 done.set()
-                for task in probes + streams:
-                    task.cancel()
-                await asyncio.gather(*probes, *streams, return_exceptions=True)
+                if resources is not None:
+                    await asyncio.gather(resources, return_exceptions=True)
                 server.should_exit = True
                 await serving
+                if probes is not None and probes.pid is not None:
+                    await asyncio.to_thread(probes.join, 5)
+                    if probes.is_alive():
+                        probes.terminate()
+                        await asyncio.to_thread(probes.join, 5)
     finally:
+        receive.close()
+        send.close()
         logging.getLogger().removeHandler(handler)
         logging.getLogger("uvicorn").removeHandler(handler)
 
@@ -226,6 +267,7 @@ async def simulate(directory, duration):
               "expected_logs": expected, "persisted_logs": persisted, "detail_sse_logs": counts[1, "log"],
               "global_sse_logs": counts[0, "log"], "global_sse_task_events": counts[0, "task"],
               "dropped_logs": app.log_writer.dropped_count, "max_sampled_queue": max(queues),
+              "failed_writes": app.log_writer.failed_count, "log_poll_p99_ms": p99(log_poll),
               "health_p99_ms": p99(health), "task_p99_ms": p99(detail),
               "asgi_health_p99_ms": p99(service_samples["health"]), "asgi_task_p99_ms": p99(service_samples["task"]),
               "health_samples": len(health), "task_samples": len(detail), "error_count": len(handler.errors)}
@@ -235,6 +277,7 @@ async def simulate(directory, duration):
     print(json.dumps(report, indent=2))
     assert persisted == counts[1, "log"] == expected
     assert counts[0, "log"] == app.log_writer.dropped_count == 0
+    assert app.log_writer.failed_count == 0
     assert counts[0, "task"] > 0
     assert p99(health) < 50 and p99(detail) < 50
     assert not handler.errors, handler.errors

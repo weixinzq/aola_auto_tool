@@ -104,6 +104,15 @@ class Store:
             raise ServiceError("not_found", "账号不存在", 404)
         return self._account(row, private)
 
+    def get_accounts_by_ids(self, account_ids: list[str], private=False) -> list[dict]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(select(accounts).where(accounts.c.account_id.in_(account_ids))).mappings()
+            by_id = {row["account_id"]: row for row in rows}
+        try:
+            return [self._account(by_id[account_id], private) for account_id in account_ids]
+        except KeyError:
+            raise ServiceError("not_found", "账号不存在", 404) from None
+
     def create_account(self, config):
         account_id = uuid4().hex
         with self.engine.begin() as connection:
@@ -242,9 +251,14 @@ class Store:
     def delete_tasks(self, task_ids):
         if not task_ids:
             return
+        batch = select(logs.c.id).where(logs.c.task_id.in_(task_ids)).order_by(logs.c.id).limit(10000)
+        while True:
+            with self.engine.begin() as connection:
+                deleted = connection.execute(logs.delete().where(logs.c.id.in_(batch))).rowcount
+            if deleted < 10000:
+                break
         with self.engine.begin() as connection:
             connection.execute(task_step_batches.delete().where(task_step_batches.c.task_id.in_(task_ids)))
-            connection.execute(logs.delete().where(logs.c.task_id.in_(task_ids)))
             connection.execute(tasks.delete().where(tasks.c.task_id.in_(task_ids)))
 
     def append_log(self, task_id, account_id, message):
